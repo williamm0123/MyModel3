@@ -4,25 +4,29 @@ Quick training script for MyModel3 (MVSFormer++).
 
 Default behavior is debug-friendly:
 - 1 epoch
-- TensorBoard logs under runs/tensorboard/
+- TensorBoard logs under ../log/tensorboard/
 - optional step limits for fast sanity training
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import builtins
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 
 def _ensure_tensorboard_numpy_compat() -> None:
@@ -58,6 +62,62 @@ from utils.config import load_cfg
 from models.network.network import Network
 from models.network.Depth_estimator import DepthEstimator, DepthEstimatorCfg
 from models.losses import MultiStageLoss, LossCfg, create_multiscale_gt
+
+
+def _dist_enabled() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _get_rank() -> int:
+    return dist.get_rank() if _dist_enabled() else 0
+
+
+def _get_world_size() -> int:
+    return dist.get_world_size() if _dist_enabled() else 1
+
+
+def _is_main_process() -> bool:
+    return _get_rank() == 0
+
+
+def _setup_distributed() -> Tuple[bool, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False, 0
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend, init_method="env://")
+    return True, local_rank
+
+
+def _cleanup_distributed() -> None:
+    if _dist_enabled():
+        dist.destroy_process_group()
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def _all_reduce_epoch_stats(
+    total_stats: Dict[str, float],
+    num_steps: int,
+    device: torch.device,
+) -> Tuple[Dict[str, float], int]:
+    if not _dist_enabled():
+        return total_stats, num_steps
+
+    keys = sorted(total_stats.keys())
+    values = [float(total_stats[k]) for k in keys]
+    payload = torch.tensor(values + [float(num_steps)], device=device, dtype=torch.float64)
+    dist.all_reduce(payload, op=dist.ReduceOp.SUM)
+
+    reduced_steps = int(payload[-1].item())
+    reduced_stats = {k: float(payload[i].item()) for i, k in enumerate(keys)}
+    return reduced_stats, reduced_steps
 
 
 class MVSModel(nn.Module):
@@ -192,7 +252,7 @@ def _depth_to_image(depth: torch.Tensor) -> torch.Tensor:
 
 
 def log_training_images(
-    writer: SummaryWriter,
+    writer: Optional[SummaryWriter],
     batch: Dict[str, torch.Tensor],
     outputs: Dict[str, Any],
     global_step: int,
@@ -200,6 +260,8 @@ def log_training_images(
     """
     Log training images/features for TensorBoard.
     """
+    if writer is None:
+        return
     images = batch["images"]
     writer.add_image("train_images/ref_view", images[0, 0].detach().cpu().clamp(0, 1), global_step)
     if images.shape[1] > 1:
@@ -256,13 +318,14 @@ def save_checkpoint(
     tb_log_dir: str,
 ) -> None:
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    network_state = model.network.state_dict() if hasattr(model, "network") else None
-    depth_estimator_state = model.depth_estimator.state_dict() if hasattr(model, "depth_estimator") else None
+    model_to_save = _unwrap_model(model)
+    network_state = model_to_save.network.state_dict() if hasattr(model_to_save, "network") else None
+    depth_estimator_state = model_to_save.depth_estimator.state_dict() if hasattr(model_to_save, "depth_estimator") else None
     payload = {
         "epoch": epoch,
         "global_step": global_step,
         "best_metric": best_metric,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_to_save.state_dict(),
         "network_state_dict": network_state,
         "depth_estimator_state_dict": depth_estimator_state,
         "optimizer_state_dict": optimizer.state_dict(),
@@ -287,7 +350,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     scaler: Optional[GradScaler],
     loss_fn: nn.Module,
-    writer: SummaryWriter,
+    writer: Optional[SummaryWriter],
     device: torch.device,
     epoch: int,
     use_amp: bool,
@@ -312,7 +375,12 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        should_log_images = (image_log_interval > 0) and (global_step % image_log_interval == 0)
+        # Never request intermediates unless we're actually going to log them (saves memory).
+        should_log_images = (
+            writer is not None
+            and (image_log_interval > 0)
+            and (global_step % image_log_interval == 0)
+        )
 
         if scaler is not None:
             with autocast(enabled=use_amp):
@@ -343,18 +411,20 @@ def train_one_epoch(
         step_stats = {k: float(v.detach().item()) for k, v in loss_dict.items()}
         for key, value in step_stats.items():
             total_stats[key] = total_stats.get(key, 0.0) + value
-            writer.add_scalar(f"train/{key}", value, global_step)
+            if writer is not None:
+                writer.add_scalar(f"train/{key}", value, global_step)
 
-        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("train/depth_mean", float(outputs["depth"].mean().detach().item()), global_step)
-        writer.add_scalar("train/depth_std", float(outputs["depth"].std().detach().item()), global_step)
+        if writer is not None:
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar("train/depth_mean", float(outputs["depth"].mean().detach().item()), global_step)
+            writer.add_scalar("train/depth_std", float(outputs["depth"].std().detach().item()), global_step)
         if should_log_images:
             cpu_batch = {
                 "images": images.detach().cpu(),
             }
             log_training_images(writer, cpu_batch, outputs, global_step)
 
-        if step_idx % log_interval == 0:
+        if _is_main_process() and (step_idx % log_interval == 0):
             elapsed = time.time() - start
             print(
                 f"Epoch {epoch + 1} Step {step_idx}/{len(loader)} "
@@ -364,7 +434,10 @@ def train_one_epoch(
     if num_steps == 0:
         return {"total": 0.0}, global_step
 
-    avg_stats = {k: v / num_steps for k, v in total_stats.items()}
+    reduced_stats, reduced_steps = _all_reduce_epoch_stats(total_stats, num_steps, device)
+    if reduced_steps <= 0:
+        return {"total": 0.0}, global_step
+    avg_stats = {k: v / reduced_steps for k, v in reduced_stats.items()}
     return avg_stats, global_step
 
 
@@ -396,8 +469,13 @@ def evaluate_one_epoch(
         num_steps += 1
 
     if num_steps == 0:
+        reduced_stats, reduced_steps = _all_reduce_epoch_stats({"total": 0.0}, 0, device)
+        return {"total": 0.0} if reduced_steps == 0 else {k: v / reduced_steps for k, v in reduced_stats.items()}
+
+    reduced_stats, reduced_steps = _all_reduce_epoch_stats(total_stats, num_steps, device)
+    if reduced_steps <= 0:
         return {"total": 0.0}
-    return {k: v / num_steps for k, v in total_stats.items()}
+    return {k: v / reduced_steps for k, v in reduced_stats.items()}
 
 
 def resolve_tb_log_dir(project_root: Path, tb_root: str, run_name: str) -> Path:
@@ -413,7 +491,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="config/mvs.json", help="Path to mvs.json")
     parser.add_argument("--data_root", type=str, default="", help="Override datapath in config")
     parser.add_argument("--epochs", type=int, default=16, help="Training epochs (default: 16)")
-    parser.add_argument("--batch_size", type=int, default=0, help="Override batch size")
+    parser.add_argument("--batch_size", type=int, default=0, help="Override batch size (per GPU)")
     parser.add_argument("--num_workers", type=int, default=-1, help="Override dataloader workers")
     parser.add_argument("--lr", type=float, default=0.0, help="Override learning rate")
     parser.add_argument("--weight_decay", type=float, default=-1.0, help="Override weight decay")
@@ -435,189 +513,231 @@ def main() -> None:
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
-    cfg_dict = load_cfg(args.config)
+    distributed, local_rank = _setup_distributed()
 
-    cfg_dict.setdefault("train", {})
-    cfg_dict["train"]["epochs"] = args.epochs
-    if args.batch_size > 0:
-        cfg_dict["train"]["batch_size"] = args.batch_size
-    if args.num_workers >= 0:
-        cfg_dict["train"]["num_workers"] = args.num_workers
-    if args.lr > 0:
-        cfg_dict["train"]["lr"] = args.lr
-    if args.weight_decay >= 0:
-        cfg_dict["train"]["weight_decay"] = args.weight_decay
+    try:
+        cfg_dict = load_cfg(args.config)
 
-    if args.data_root:
-        cfg_dict["datapath"] = args.data_root
+        cfg_dict.setdefault("train", {})
+        cfg_dict["train"]["epochs"] = args.epochs
+        if args.batch_size > 0:
+            cfg_dict["train"]["batch_size"] = args.batch_size
+        if args.num_workers >= 0:
+            cfg_dict["train"]["num_workers"] = args.num_workers
+        if args.lr > 0:
+            cfg_dict["train"]["lr"] = args.lr
+        if args.weight_decay >= 0:
+            cfg_dict["train"]["weight_decay"] = args.weight_decay
 
-    train_cfg = cfg_dict["train"]
-    batch_size = int(train_cfg.get("batch_size", 1))
-    num_workers = int(train_cfg.get("num_workers", 2))
-    lr = float(train_cfg.get("lr", 1e-4))
-    weight_decay = float(train_cfg.get("weight_decay", 1e-4))
-    grad_clip = float(train_cfg.get("grad_clip", 1.0))
-    use_amp = bool(train_cfg.get("use_amp", True)) and (not args.no_amp)
+        if args.data_root:
+            cfg_dict["datapath"] = args.data_root
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        train_cfg = cfg_dict["train"]
+        batch_size = int(train_cfg.get("batch_size", 1))
+        num_workers = int(train_cfg.get("num_workers", 2))
+        lr = float(train_cfg.get("lr", 1e-4))
+        weight_decay = float(train_cfg.get("weight_decay", 1e-4))
+        grad_clip = float(train_cfg.get("grad_clip", 1.0))
+        use_amp = bool(train_cfg.get("use_amp", True)) and (not args.no_amp)
 
-    if args.mock:
-        num_views = len(cfg_dict.get("views", [0, 1, 2]))
-        train_dataset = MockMVSDataset(num_samples=64, num_views=num_views)
-        val_dataset = MockMVSDataset(num_samples=16, num_views=num_views)
-        # Debug-friendly default: avoid multiprocessing issues for quick mock runs.
-        if args.num_workers < 0:
-            num_workers = 0
-    else:
-        if not cfg_dict.get("datapath", ""):
-            raise ValueError("No datapath configured. Set 'datapath' in config or pass --data_root.")
-        train_dataset = DTUData(cfg_dict, split="train", sample_mode="mvs")
-        val_dataset = DTUData(cfg_dict, split="val", sample_mode="mvs")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-    )
-    val_loader = None if args.no_val else DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    model = MVSModel(cfg_dict, device=device).to(device)
-    loss_fn = build_loss_fn(cfg_dict).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    steps_per_epoch = len(train_loader) if args.max_train_steps <= 0 else min(len(train_loader), args.max_train_steps)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, args.epochs * max(1, steps_per_epoch)),
-        eta_min=lr * 0.01,
-    )
-    scaler = GradScaler(enabled=(use_amp and device.type == "cuda"))
-
-    run_name = args.run_name.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
-    tb_log_dir = resolve_tb_log_dir(project_root, args.tb_root, run_name)
-    ckpt_root = Path(args.ckpt_root)
-    if not ckpt_root.is_absolute():
-        ckpt_root = project_root / ckpt_root
-    ckpt_dir = ckpt_root / run_name
-    latest_ckpt = ckpt_dir / "latest.pth"
-    best_ckpt = ckpt_dir / "best.pth"
-    writer = SummaryWriter(log_dir=str(tb_log_dir))
-
-    run_meta = {
-        "run_name": run_name,
-        "tb_log_dir": str(tb_log_dir),
-        "ckpt_dir": str(ckpt_dir),
-        "latest_ckpt": str(latest_ckpt),
-        "best_ckpt": str(best_ckpt),
-        "cfg": cfg_dict,
-        "args": vars(args),
-    }
-    dump_run_params(ckpt_dir / "run_params.json", run_meta)
-
-    print(f"[TensorBoard] logdir: {tb_log_dir}")
-    print("[TensorBoard] VSCode: Python: Launch TensorBoard -> select this logdir.")
-    print(f"[Checkpoint] dir: {ckpt_dir}")
-    print(f"Train batches: {len(train_loader)}")
-    if val_loader is not None:
-        print(f"Val batches: {len(val_loader)}")
-
-    global_step = 0
-    best_metric = float("inf")
-    for epoch in range(args.epochs):
-        print(f"\n{'=' * 60}")
-        print(f"Epoch {epoch + 1}/{args.epochs}")
-        print("=" * 60)
-
-        train_stats, global_step = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler if scaler.is_enabled() else None,
-            loss_fn=loss_fn,
-            writer=writer,
-            device=device,
-            epoch=epoch,
-            use_amp=(use_amp and device.type == "cuda"),
-            grad_clip=grad_clip,
-            log_interval=max(1, args.log_interval),
-            image_log_interval=max(1, args.image_log_interval),
-            max_steps=args.max_train_steps,
-            global_step=global_step,
-            scheduler=scheduler,
-        )
-        print(f"Train: {train_stats}")
-        for key, value in train_stats.items():
-            writer.add_scalar(f"train_epoch/{key}", value, epoch)
-
-        if val_loader is not None:
-            val_stats = evaluate_one_epoch(
-                model=model,
-                loader=val_loader,
-                loss_fn=loss_fn,
-                device=device,
-                max_steps=args.max_val_steps,
-                use_amp=(use_amp and device.type == "cuda"),
-            )
-            print(f"Val: {val_stats}")
-            for key, value in val_stats.items():
-                writer.add_scalar(f"val_epoch/{key}", value, epoch)
-            current_metric = float(val_stats.get("total", train_stats.get("total", float("inf"))))
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{local_rank}" if distributed else "cuda:0")
         else:
-            current_metric = float(train_stats.get("total", float("inf")))
+            device = torch.device("cpu")
 
-        # Always save latest checkpoint each epoch.
-        save_checkpoint(
-            ckpt_path=latest_ckpt,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            epoch=epoch,
-            global_step=global_step,
-            best_metric=best_metric,
-            cfg_dict=cfg_dict,
-            args_dict=vars(args),
-            tb_log_dir=str(tb_log_dir),
+        if _is_main_process():
+            print(f"Using device: {device}")
+            if device.type == "cuda":
+                idx = 0 if device.index is None else int(device.index)
+                print(f"GPU: {torch.cuda.get_device_name(idx)}")
+
+        if args.mock:
+            num_views = len(cfg_dict.get("views", [0, 1, 2]))
+            train_dataset = MockMVSDataset(num_samples=64, num_views=num_views)
+            val_dataset = MockMVSDataset(num_samples=16, num_views=num_views) if not args.no_val else None
+            if args.num_workers < 0:
+                num_workers = 0
+        else:
+            if not cfg_dict.get("datapath", ""):
+                raise ValueError("No datapath configured. Set 'datapath' in config or pass --data_root.")
+            train_dataset = DTUData(cfg_dict, split="train", sample_mode="mvs")
+            val_dataset = None if args.no_val else DTUData(cfg_dict, split="val", sample_mode="mvs")
+
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if distributed else None
+        val_sampler = (
+            DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+            if (distributed and val_dataset is not None)
+            else None
         )
 
-        # Save best checkpoint.
-        if current_metric < best_metric:
-            best_metric = current_metric
-            save_checkpoint(
-                ckpt_path=best_ckpt,
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            drop_last=True,
+        )
+        val_loader = None if val_dataset is None else DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        model: nn.Module = MVSModel(cfg_dict, device=device).to(device)
+        if distributed:
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+        loss_fn = build_loss_fn(cfg_dict).to(device)
+        optimizer = optim.AdamW(_unwrap_model(model).parameters(), lr=lr, weight_decay=weight_decay)
+
+        steps_per_epoch = len(train_loader) if args.max_train_steps <= 0 else min(len(train_loader), args.max_train_steps)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs * max(1, steps_per_epoch)),
+            eta_min=lr * 0.01,
+        )
+        scaler = GradScaler(enabled=(use_amp and device.type == "cuda"))
+
+        run_name = args.run_name.strip()
+        if not run_name and _is_main_process():
+            run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if distributed:
+            name_list: List[str] = [run_name]
+            dist.broadcast_object_list(name_list, src=0)
+            run_name = str(name_list[0])
+
+        tb_log_dir = resolve_tb_log_dir(project_root, args.tb_root, run_name) if _is_main_process() else None
+        ckpt_root = Path(args.ckpt_root)
+        if not ckpt_root.is_absolute():
+            ckpt_root = project_root / ckpt_root
+        ckpt_dir = ckpt_root / run_name
+        latest_ckpt = ckpt_dir / "latest.pth"
+        best_ckpt = ckpt_dir / "best.pth"
+        writer: Optional[SummaryWriter] = SummaryWriter(log_dir=str(tb_log_dir)) if tb_log_dir is not None else None
+
+        if _is_main_process():
+            run_meta = {
+                "run_name": run_name,
+                "tb_log_dir": str(tb_log_dir),
+                "ckpt_dir": str(ckpt_dir),
+                "latest_ckpt": str(latest_ckpt),
+                "best_ckpt": str(best_ckpt),
+                "cfg": cfg_dict,
+                "args": vars(args),
+            }
+            dump_run_params(ckpt_dir / "run_params.json", run_meta)
+
+            print(f"[TensorBoard] logdir: {tb_log_dir}")
+            print("[TensorBoard] VSCode: Python: Launch TensorBoard -> select this logdir.")
+            print(f"[Checkpoint] dir: {ckpt_dir}")
+            print(f"Train batches (per-rank): {len(train_loader)} world_size={_get_world_size()}")
+            if val_loader is not None:
+                print(f"Val batches (per-rank): {len(val_loader)}")
+
+        global_step = 0
+        best_metric = float("inf")
+        for epoch in range(args.epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
+
+            if _is_main_process():
+                print("\n" + "=" * 60)
+                print(f"Epoch {epoch + 1}/{args.epochs}")
+                print("=" * 60)
+
+            train_stats, global_step = train_one_epoch(
                 model=model,
+                loader=train_loader,
                 optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
+                scaler=scaler if scaler.is_enabled() else None,
+                loss_fn=loss_fn,
+                writer=writer,
+                device=device,
                 epoch=epoch,
+                use_amp=(use_amp and device.type == "cuda"),
+                grad_clip=grad_clip,
+                log_interval=max(1, args.log_interval),
+                image_log_interval=args.image_log_interval,
+                max_steps=args.max_train_steps,
                 global_step=global_step,
-                best_metric=best_metric,
-                cfg_dict=cfg_dict,
-                args_dict=vars(args),
-                tb_log_dir=str(tb_log_dir),
+                scheduler=scheduler,
             )
-            print(f"Best checkpoint updated: metric={best_metric:.6f}")
+            if _is_main_process():
+                print(f"Train: {train_stats}")
+            if writer is not None:
+                for key, value in train_stats.items():
+                    writer.add_scalar(f"train_epoch/{key}", value, epoch)
 
-        writer.flush()
+            if val_loader is not None:
+                val_stats = evaluate_one_epoch(
+                    model=model,
+                    loader=val_loader,
+                    loss_fn=loss_fn,
+                    device=device,
+                    max_steps=args.max_val_steps,
+                    use_amp=(use_amp and device.type == "cuda"),
+                )
+                if _is_main_process():
+                    print(f"Val: {val_stats}")
+                if writer is not None:
+                    for key, value in val_stats.items():
+                        writer.add_scalar(f"val_epoch/{key}", value, epoch)
+                current_metric = float(val_stats.get("total", train_stats.get("total", float("inf"))))
+            else:
+                current_metric = float(train_stats.get("total", float("inf")))
 
-    writer.close()
-    print("\nTraining finished.")
-    if best_metric < float("inf"):
-        print(f"Best metric: {best_metric:.6f}")
-    print(f"Latest checkpoint: {latest_ckpt}")
-    print(f"Best checkpoint: {best_ckpt}")
+            if _is_main_process():
+                save_checkpoint(
+                    ckpt_path=latest_ckpt,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_metric=best_metric,
+                    cfg_dict=cfg_dict,
+                    args_dict=vars(args),
+                    tb_log_dir=str(tb_log_dir),
+                )
+
+                if current_metric < best_metric:
+                    best_metric = current_metric
+                    save_checkpoint(
+                        ckpt_path=best_ckpt,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_metric=best_metric,
+                        cfg_dict=cfg_dict,
+                        args_dict=vars(args),
+                        tb_log_dir=str(tb_log_dir),
+                    )
+                    print(f"Best checkpoint updated: metric={best_metric:.6f}")
+
+            if writer is not None:
+                writer.flush()
+
+        if writer is not None:
+            writer.close()
+        if _is_main_process():
+            print("\nTraining finished.")
+            if best_metric < float("inf"):
+                print(f"Best metric: {best_metric:.6f}")
+            print(f"Latest checkpoint: {latest_ckpt}")
+            print(f"Best checkpoint: {best_ckpt}")
+    finally:
+        _cleanup_distributed()
 
 
 if __name__ == "__main__":

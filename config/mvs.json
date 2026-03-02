@@ -1,5 +1,5 @@
 {
-  "comment": "Merged MVSFormer++ configuration (ultra low-memory debug profile)",
+  "comment": "Merged MVSFormer++ configuration (balanced debug profile)",
   "mode": "train",
 
   "datapath": "${DATA_ROOT}/dataset/DTU/dtu_training/",
@@ -7,7 +7,7 @@
   "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",
   "light_mode": "A",
-  "views": [0, 1],
+  "views": [0, 1, 2],
 
   "train": {
     "epochs": 16,
@@ -30,15 +30,15 @@
 
   "fpn": {
     "comment": "FPN channel config: [stage4, stage3, stage2, stage1]",
-    "feat_chs": [4, 8, 16, 32],
-    "fpn_out_ch": 32
+    "feat_chs": [8, 16, 32, 64],
+    "fpn_out_ch": 64
   },
 
   "dinov3": {
     "weights": "${DATA_ROOT}/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
     "arch": "dinov3_vitb16",
     "patch_size": 16,
-    "input_scale": 0.25,
+    "input_scale": 0.5,
     "vit_ch": 768,
     "use_imagenet_norm": true,
     "pick_layers": [3, 7, 11],
@@ -49,7 +49,7 @@
   "sva": {
     "comment": "Side View Attention (CrossVITDecoder)",
     "dim": 768,
-    "num_heads": 8,
+    "num_heads": 12,
     "mlp_ratio": 4.0,
     "cross_interval_layers": 3,
     "init_values": 1.0,
@@ -65,7 +65,7 @@
 
   "fmt": {
     "comment": "Feature Matching Transformer",
-    "nhead": 2,
+    "nhead": 4,
     "mlp_ratio": 4.0,
     "init_values": 1.0,
     "layer_names": ["self", "cross", "self", "cross"]
@@ -73,18 +73,18 @@
 
   "depth": {
     "comment": "Multi-stage depth estimation config",
-    "ndepths": [8, 4, 2, 2],
-    "base_chs": [32, 16, 8, 4],
+    "ndepths": [16, 8, 4, 2],
+    "base_chs": [64, 32, 16, 8],
     "depth_interval_ratios": [4.0, 2.0, 1.0, 0.5],
     "inverse_depth": true,
     "depth_type": "regression",
     "temperatures": [5.0, 5.0, 5.0, 1.0]
   },
 
-"dataset": {
-  "rectified_dir": "Rectified_raw",
-  "resize_hw": [256, 320]
-},
+  "dataset": {
+    "rectified_dir": "Rectified_raw",
+    "resize_hw": [384, 512]
+  },
 
   "output": {
     "runs_dir": "../log"
