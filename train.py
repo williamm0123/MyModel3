@@ -312,8 +312,9 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        should_log_images = (image_log_interval > 0) and (global_step % image_log_interval == 0)
+
         if scaler is not None:
-            should_log_images = (global_step % max(1, image_log_interval) == 0)
             with autocast(enabled=use_amp):
                 outputs = model(images, proj_matrices, depth_range, return_intermediate=should_log_images)
                 loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
@@ -325,7 +326,6 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            should_log_images = (global_step % max(1, image_log_interval) == 0)
             outputs = model(images, proj_matrices, depth_range, return_intermediate=should_log_images)
             loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
             total_loss = loss_dict["total"]
@@ -423,7 +423,12 @@ def main() -> None:
     parser.add_argument("--mock", action="store_true", help="Use mock dataset")
     parser.add_argument("--no_amp", action="store_true", help="Disable AMP")
     parser.add_argument("--log_interval", type=int, default=10, help="Console log interval")
-    parser.add_argument("--image_log_interval", type=int, default=50, help="TensorBoard image log interval (steps)")
+    parser.add_argument(
+        "--image_log_interval",
+        type=int,
+        default=-1,
+        help="TensorBoard image log interval in steps; <=0 disables image logging to save memory",
+    )
     parser.add_argument("--tb_root", type=str, default="runs/tensorboard", help="TensorBoard root directory")
     parser.add_argument("--ckpt_root", type=str, default="runs/checkpoints", help="Checkpoint root directory")
     parser.add_argument("--run_name", type=str, default="", help="TensorBoard run name")

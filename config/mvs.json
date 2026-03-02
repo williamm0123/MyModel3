@@ -1,5 +1,5 @@
 {
-  "comment": "Merged MVSFormer++ configuration (Architecture + Training)",
+  "comment": "Merged MVSFormer++ configuration (temporary low-memory debug profile)",
   "mode": "train",
 
   "datapath": "${DATA_ROOT}/dataset/DTU/dtu_training/",
@@ -7,11 +7,11 @@
   "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",
   "light_mode": "A",
-  "views": [0, 1, 2],
+  "views": [0, 1],
 
   "train": {
     "epochs": 16,
-    "batch_size": 2,
+    "batch_size": 1,
     "num_workers": 4,
     "lr": 1e-4,
     "weight_decay": 1e-4,
@@ -72,7 +72,7 @@
 
   "depth": {
     "comment": "Multi-stage depth estimation config",
-    "ndepths": [32, 16, 8, 4],
+    "ndepths": [16, 8, 4, 2],
     "base_chs": [64, 32, 16, 8],
     "depth_interval_ratios": [4.0, 2.0, 1.0, 0.5],
     "inverse_depth": true,
@@ -81,7 +81,7 @@
   },
 
 "dataset": {
-  "rectified_dir": "Rectified"
+  "rectified_dir": "Rectified_raw"
 },
 
   "output": {
