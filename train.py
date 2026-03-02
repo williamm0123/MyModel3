@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -426,7 +426,7 @@ def train_one_epoch(
         )
 
         if scaler is not None:
-            with autocast(enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 outputs = model(images, proj_matrices, depth_range, return_intermediate=should_log_images)
                 loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
                 total_loss = loss_dict["total"]
@@ -434,8 +434,11 @@ def train_one_epoch(
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            prev_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None and scaler.get_scale() >= prev_scale:
+                scheduler.step()
         else:
             outputs = model(images, proj_matrices, depth_range, return_intermediate=should_log_images)
             loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
@@ -444,9 +447,8 @@ def train_one_epoch(
             if grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
         num_steps += 1
         global_step += 1
@@ -503,7 +505,7 @@ def evaluate_one_epoch(
         images, depth_gt, mask, depth_range, depth_interval, proj_matrices = move_batch_to_device(batch, device)
         depth_gt_ms, mask_ms = create_multiscale_gt(depth_gt, mask)
 
-        with autocast(enabled=use_amp):
+        with autocast(device_type=device.type, enabled=use_amp):
             outputs = model(images, proj_matrices, depth_range)
             loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
 
@@ -636,7 +638,12 @@ def main() -> None:
 
         model: nn.Module = MVSModel(cfg_dict, device=device).to(device)
         if distributed:
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True,
+            )
 
         loss_fn = build_loss_fn(cfg_dict).to(device)
         optimizer = optim.AdamW(_unwrap_model(model).parameters(), lr=lr, weight_decay=weight_decay)
@@ -647,7 +654,7 @@ def main() -> None:
             T_max=max(1, args.epochs * max(1, steps_per_epoch)),
             eta_min=lr * 0.01,
         )
-        scaler = GradScaler(enabled=(use_amp and device.type == "cuda"))
+        scaler = GradScaler(device=device.type, enabled=(use_amp and device.type == "cuda"))
 
         run_name = args.run_name.strip()
         if not run_name and _is_main_process():
