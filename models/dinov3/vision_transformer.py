@@ -1,7 +1,7 @@
 # models/dinov3/vision_transformer.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple, Optional
+from typing import Dict, List, Sequence, Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -147,43 +147,79 @@ class DinoVisionTransformer(nn.Module):
             "hw": torch.tensor([Hp, Wp], device=x.device),
         }
 
+    def _resolve_blocks_to_take(
+        self,
+        *,
+        layers_1based: Optional[Sequence[int]],
+        n: Optional[Union[int, Sequence[int]]],
+    ) -> List[int]:
+        if layers_1based is not None:
+            blocks = [int(i) - 1 for i in layers_1based]
+        else:
+            n = 1 if n is None else n
+            if isinstance(n, int):
+                if n <= 0 or n > self.depth:
+                    raise ValueError(f"n must be in [1, {self.depth}], got {n}")
+                blocks = list(range(self.depth - n, self.depth))
+            else:
+                blocks = [int(i) for i in n]
+
+        if not blocks:
+            raise ValueError("No intermediate layer selected")
+        if any(i < 0 or i >= self.depth for i in blocks):
+            raise ValueError(f"Layer indices out of range [0, {self.depth - 1}]: {blocks}")
+        return blocks
+
     def get_intermediate_layers(
         self,
         x: Tensor,
-        layers_1based: Sequence[int],
+        layers_1based: Optional[Sequence[int]] = None,
         *,
+        n: Optional[Union[int, Sequence[int]]] = None,
+        reshape: bool = False,
+        return_class_token: bool = False,
+        return_extra_tokens: bool = False,
         norm: bool = True,
-        reshape: bool = True,
         return_cls: bool = False,
-    ) -> List[Tensor]:
+    ):
         """
-        你要的接口：输入图像，返回第 3/7/11 层输出
-        layers_1based: e.g. [3,7,11]（按 1-based 语义）
-        return:
-          if reshape: (B,C,Hp,Wp) patch feature maps
-          else: (B,N,C) patch tokens
+        Supports both local and official-style APIs:
+          - local:   get_intermediate_layers(x, layers_1based=[3, 7, 11], reshape=True, norm=True)
+          - official:get_intermediate_layers(x, n=[2, 6, 10], reshape=True, norm=True)
         """
-        want = set(int(i) for i in layers_1based)
-        assert all(1 <= i <= self.depth for i in want)
+        if return_cls:
+            return_class_token = True
+
+        blocks_to_take = self._resolve_blocks_to_take(layers_1based=layers_1based, n=n)
+        wanted = set(blocks_to_take)
 
         tokens, (Hp, Wp) = self.prepare_tokens(x)
         rope = self._rope_for_hw(Hp, Wp)
 
         outs: Dict[int, Tensor] = {}
-        for i, blk in enumerate(self.blocks, start=1):
+        for i, blk in enumerate(self.blocks):
             tokens = blk(tokens, rope)
-            if i in want:
-                t = self.norm(tokens) if norm else tokens
-                patch = t[:, 1 + self.n_storage_tokens:]  # (B,N,C)
-                if reshape:
-                    B, N, C = patch.shape
-                    fm = patch.transpose(1, 2).contiguous().view(B, C, Hp, Wp)
-                    outs[i] = fm
-                else:
-                    outs[i] = patch
-                if return_cls:
-                    # 需要的话你可以再返回 cls，这里先不扩展，保持最小化
-                    pass
+            if i in wanted:
+                outs[i] = self.norm(tokens) if norm else tokens
 
-        # 保持输入顺序输出
-        return [outs[i] for i in layers_1based]
+        if len(outs) != len(wanted):
+            raise RuntimeError(f"Only collected {len(outs)} / {len(wanted)} layers")
+
+        ordered = [outs[i] for i in blocks_to_take]
+        class_tokens = [out[:, 0] for out in ordered]
+        extra_tokens = [out[:, 1 : self.n_storage_tokens + 1] for out in ordered]
+        patch_tokens = [out[:, 1 + self.n_storage_tokens :] for out in ordered]
+
+        if reshape:
+            patch_tokens = [
+                patch.transpose(1, 2).contiguous().view(patch.shape[0], patch.shape[2], Hp, Wp)
+                for patch in patch_tokens
+            ]
+
+        if not return_class_token and not return_extra_tokens:
+            return patch_tokens
+        if return_class_token and not return_extra_tokens:
+            return list(zip(patch_tokens, class_tokens))
+        if not return_class_token and return_extra_tokens:
+            return list(zip(patch_tokens, extra_tokens))
+        return list(zip(patch_tokens, class_tokens, extra_tokens))

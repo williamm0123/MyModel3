@@ -3,8 +3,8 @@
   "mode": "train",
 
   "datapath": "/home/william/project/dataset/mvs_training",
-  "train_data_list": "/home/william/project/MyModel3/lists/dtu/train.txt",
-  "val_data_list": "/home/william/project/MyModel3/lists/dtu/test.txt",
+  "train_data_list": "lists/dtu/train.txt",
+  "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",
   "light_mode": "A",
   "views": [0, 1, 2],
@@ -35,8 +35,7 @@
   },
 
   "dinov3": {
-    "repo_dir": "/home/william/project/dinov3",
-    "weights": "/home/william/project/dataset/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "weights": "pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
     "arch": "dinov3_vitb16",
     "patch_size": 16,
     "vit_ch": 768,

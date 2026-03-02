@@ -43,8 +43,10 @@ def _ensure_tensorboard_numpy_compat() -> None:
         "complex": complex,
         "str": str,
     }
+    # Use module dict lookup instead of hasattr(np, name) to avoid
+    # triggering NumPy FutureWarning on deprecated alias access.
     for name, value in np_aliases.items():
-        if not hasattr(np, name):
+        if name not in np.__dict__:
             setattr(np, name, value)
 
 
