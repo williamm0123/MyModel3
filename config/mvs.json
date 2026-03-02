@@ -1,5 +1,5 @@
 {
-  "comment": "Merged MVSFormer++ configuration (balanced debug profile)",
+  "comment": "Merged MVSFormer++ configuration (high-memory profile for 2xV100 32GB)",
   "mode": "train",
 
   "datapath": "${DATA_ROOT}/dataset/DTU/dtu_training/",
@@ -7,11 +7,11 @@
   "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",
   "light_mode": "A",
-  "views": [0, 1, 2],
+  "views": [0, 1, 2, 3],
 
   "train": {
     "epochs": 16,
-    "batch_size": 1,
+    "batch_size": 2,
     "num_workers": 4,
     "lr": 1e-4,
     "weight_decay": 1e-4,
@@ -38,7 +38,7 @@
     "weights": "${DATA_ROOT}/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
     "arch": "dinov3_vitb16",
     "patch_size": 16,
-    "input_scale": 0.5,
+    "input_scale": 1.0,
     "vit_ch": 768,
     "use_imagenet_norm": true,
     "pick_layers": [3, 7, 11],
@@ -73,7 +73,7 @@
 
   "depth": {
     "comment": "Multi-stage depth estimation config",
-    "ndepths": [16, 8, 4, 2],
+    "ndepths": [32, 16, 8, 4],
     "base_chs": [64, 32, 16, 8],
     "depth_interval_ratios": [4.0, 2.0, 1.0, 0.5],
     "inverse_depth": true,
@@ -83,7 +83,7 @@
 
   "dataset": {
     "rectified_dir": "Rectified_raw",
-    "resize_hw": [384, 512]
+    "resize_hw": [512, 640]
   },
 
   "output": {

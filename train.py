@@ -120,6 +120,21 @@ def _all_reduce_epoch_stats(
     return reduced_stats, reduced_steps
 
 
+def _log_cuda_memory(tag: str, device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    allocated = torch.cuda.max_memory_allocated(device=device)
+    reserved = torch.cuda.max_memory_reserved(device=device)
+    payload = torch.tensor([allocated, reserved], device=device, dtype=torch.float64)
+    if _dist_enabled():
+        dist.all_reduce(payload, op=dist.ReduceOp.MAX)
+    if _is_main_process():
+        alloc_gb = float(payload[0].item()) / (1024**3)
+        res_gb = float(payload[1].item()) / (1024**3)
+        print(f"[CUDA][{tag}] max_alloc={alloc_gb:.2f}GiB max_reserved={res_gb:.2f}GiB")
+    torch.cuda.reset_peak_memory_stats(device=device)
+
+
 class MVSModel(nn.Module):
     """Feature extractor + multi-stage depth estimator."""
 
@@ -727,6 +742,7 @@ def main() -> None:
 
             if writer is not None:
                 writer.flush()
+            _log_cuda_memory(tag=f"epoch{epoch+1}", device=device)
 
         if writer is not None:
             writer.close()
