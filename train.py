@@ -54,6 +54,7 @@ _ensure_tensorboard_numpy_compat()
 from torch.utils.tensorboard import SummaryWriter
 
 from data.dtu_data import DTUData
+from utils.config import load_cfg
 from models.network.network import Network
 from models.network.Depth_estimator import DepthEstimator, DepthEstimatorCfg
 from models.losses import MultiStageLoss, LossCfg, create_multiscale_gt
@@ -429,8 +430,7 @@ def main() -> None:
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
-    with open(args.config, "r", encoding="utf-8") as file:
-        cfg_dict = json.load(file)
+    cfg_dict = load_cfg(args.config)
 
     cfg_dict.setdefault("train", {})
     cfg_dict["train"]["epochs"] = args.epochs

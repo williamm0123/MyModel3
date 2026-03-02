@@ -2,7 +2,7 @@
   "comment": "Merged MVSFormer++ configuration (Architecture + Training)",
   "mode": "train",
 
-  "datapath": "/home/william/project/dataset/mvs_training",
+  "datapath": "${DATA_ROOT}",
   "train_data_list": "lists/dtu/train.txt",
   "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",

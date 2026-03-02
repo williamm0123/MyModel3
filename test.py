@@ -12,7 +12,6 @@ This script:
 """
 from __future__ import annotations
 import argparse
-import json
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -28,7 +27,7 @@ import matplotlib.pyplot as plt
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.config import get_runs_dir
+from utils.config import get_runs_dir, load_cfg
 from data.dtu_data import DTUData
 from models.network.network import Network
 from models.network.Depth_estimator import DepthEstimator, DepthEstimatorCfg
@@ -45,14 +44,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_idx", type=int, default=0, help="Dataset sample index")
     parser.add_argument("--cpu", action="store_true", help="Force CPU")
     return parser.parse_args()
-
-
-def load_cfg_from_path(path: str) -> Dict[str, Any]:
-    cfg_path = Path(path)
-    if not cfg_path.is_absolute():
-        cfg_path = PROJECT_ROOT / cfg_path
-    with cfg_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
 
 
 def load_inference_checkpoint(
@@ -150,7 +141,7 @@ def main():
     # 1. Load config
     # --------------------------------------------------------
     print("\n[1/4] Loading config...")
-    cfg = load_cfg_from_path(args.config)
+    cfg = load_cfg(args.config)
 
     ckpt_payload: Optional[Dict[str, Any]] = None
     ckpt_path = None

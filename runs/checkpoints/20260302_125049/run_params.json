@@ -1,0 +1,162 @@
+{
+  "run_name": "20260302_125049",
+  "tb_log_dir": "/home/william/project/MyModel3/runs/tensorboard/20260302_125049",
+  "ckpt_dir": "/home/william/project/MyModel3/runs/checkpoints/20260302_125049",
+  "latest_ckpt": "/home/william/project/MyModel3/runs/checkpoints/20260302_125049/latest.pth",
+  "best_ckpt": "/home/william/project/MyModel3/runs/checkpoints/20260302_125049/best.pth",
+  "cfg": {
+    "comment": "Merged MVSFormer++ configuration (Architecture + Training)",
+    "mode": "train",
+    "datapath": "/home/william/datasets",
+    "train_data_list": "/home/william/project/MyModel3/lists/dtu/train.txt",
+    "val_data_list": "/home/william/project/MyModel3/lists/dtu/test.txt",
+    "all_views": "49",
+    "light_mode": "A",
+    "views": [
+      0,
+      1,
+      2
+    ],
+    "train": {
+      "epochs": 1,
+      "batch_size": 2,
+      "num_workers": 4,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "lr_scheduler": "cosine",
+      "use_amp": true,
+      "log_interval": 50,
+      "save_interval": 1,
+      "eval_interval": 1,
+      "grad_clip": 1.0
+    },
+    "loss": {
+      "depth_types": [
+        "reg",
+        "reg",
+        "reg",
+        "reg"
+      ],
+      "loss_weights": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "fpn": {
+      "comment": "FPN channel config: [stage4, stage3, stage2, stage1]",
+      "feat_chs": [
+        8,
+        16,
+        32,
+        64
+      ],
+      "fpn_out_ch": 64
+    },
+    "dinov3": {
+      "weights": "/home/william/project/MyModel3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+      "arch": "dinov3_vitb16",
+      "patch_size": 16,
+      "vit_ch": 768,
+      "use_imagenet_norm": true,
+      "pick_layers": [
+        3,
+        7,
+        11
+      ],
+      "scales": [
+        1,
+        0.5,
+        0.25,
+        0.125
+      ],
+      "freeze": true
+    },
+    "sva": {
+      "comment": "Side View Attention (CrossVITDecoder)",
+      "dim": 768,
+      "num_heads": 12,
+      "mlp_ratio": 4.0,
+      "cross_interval_layers": 3,
+      "init_values": 1.0,
+      "prev_values": 0.5,
+      "post_norm": false,
+      "pre_norm_query": true,
+      "no_combine_norm": false,
+      "use_als": true,
+      "init_als": 0.5,
+      "num_stage2_blocks": 2,
+      "pe_max_hw": [
+        128,
+        128
+      ]
+    },
+    "fmt": {
+      "comment": "Feature Matching Transformer",
+      "nhead": 4,
+      "mlp_ratio": 4.0,
+      "init_values": 1.0,
+      "layer_names": [
+        "self",
+        "cross",
+        "self",
+        "cross"
+      ]
+    },
+    "depth": {
+      "comment": "Multi-stage depth estimation config",
+      "ndepths": [
+        32,
+        16,
+        8,
+        4
+      ],
+      "base_chs": [
+        64,
+        32,
+        16,
+        8
+      ],
+      "depth_interval_ratios": [
+        4.0,
+        2.0,
+        1.0,
+        0.5
+      ],
+      "inverse_depth": true,
+      "depth_type": "regression",
+      "temperatures": [
+        5.0,
+        5.0,
+        5.0,
+        1.0
+      ]
+    },
+    "dataset": {
+      "rectified_dir": "Rectified"
+    },
+    "output": {
+      "runs_dir": "runs"
+    }
+  },
+  "args": {
+    "config": "config/mvs.json",
+    "data_root": "",
+    "epochs": 1,
+    "batch_size": 0,
+    "num_workers": -1,
+    "lr": 0.0,
+    "weight_decay": -1.0,
+    "max_train_steps": 0,
+    "max_val_steps": 0,
+    "no_val": false,
+    "mock": false,
+    "no_amp": false,
+    "log_interval": 10,
+    "image_log_interval": 50,
+    "tb_root": "runs/tensorboard",
+    "ckpt_root": "runs/checkpoints",
+    "run_name": ""
+  }
+}
