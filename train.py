@@ -80,7 +80,30 @@ def _is_main_process() -> bool:
     return _get_rank() == 0
 
 
+def _maybe_set_slurm_dist_env() -> None:
+    """
+    Allow launching with SLURM `srun` without torchrun.
+
+    Works reliably for single-node multi-GPU jobs. For multi-node jobs, set
+    MASTER_ADDR/MASTER_PORT explicitly (or use torchrun).
+    """
+    if "WORLD_SIZE" not in os.environ and "SLURM_NTASKS" in os.environ:
+        os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+    if "RANK" not in os.environ and "SLURM_PROCID" in os.environ:
+        os.environ["RANK"] = os.environ["SLURM_PROCID"]
+    if "LOCAL_RANK" not in os.environ and "SLURM_LOCALID" in os.environ:
+        os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
+
+    if "MASTER_ADDR" not in os.environ:
+        # For single-node jobs 127.0.0.1 is sufficient.
+        os.environ["MASTER_ADDR"] = os.environ.get("SLURM_LAUNCH_NODE_IPADDR", "127.0.0.1")
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+
+
 def _setup_distributed() -> Tuple[bool, int]:
+    _maybe_set_slurm_dist_env()
+
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return False, 0
@@ -90,6 +113,11 @@ def _setup_distributed() -> Tuple[bool, int]:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     dist.init_process_group(backend=backend, init_method="env://")
+    if _is_main_process():
+        print(
+            f"[DDP] enabled world_size={_get_world_size()} "
+            f"backend={backend} MASTER_ADDR={os.environ.get('MASTER_ADDR')} MASTER_PORT={os.environ.get('MASTER_PORT')}"
+        )
     return True, local_rank
 
 
@@ -565,6 +593,9 @@ def main() -> None:
             if device.type == "cuda":
                 idx = 0 if device.index is None else int(device.index)
                 print(f"GPU: {torch.cuda.get_device_name(idx)}")
+                print(f"[CUDA] visible_device_count={torch.cuda.device_count()}")
+        if not distributed and _is_main_process() and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            print("[DDP] disabled (WORLD_SIZE=1). Launch with torchrun or srun to use multiple GPUs.")
 
         if args.mock:
             num_views = len(cfg_dict.get("views", [0, 1, 2]))
