@@ -412,7 +412,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Quick MyModel3 training")
     parser.add_argument("--config", type=str, default="config/mvs.json", help="Path to mvs.json")
     parser.add_argument("--data_root", type=str, default="", help="Override datapath in config")
-    parser.add_argument("--epochs", type=int, default=1, help="Training epochs (default: 1)")
+    parser.add_argument("--epochs", type=int, default=16, help="Training epochs (default: 16)")
     parser.add_argument("--batch_size", type=int, default=0, help="Override batch size")
     parser.add_argument("--num_workers", type=int, default=-1, help="Override dataloader workers")
     parser.add_argument("--lr", type=float, default=0.0, help="Override learning rate")
