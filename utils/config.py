@@ -82,6 +82,6 @@ def ensure_dir(p: Path) -> Path:
 
 
 def get_runs_dir(cfg: Dict[str, Any]) -> Path:
-    runs_dir = Path(cfg.get("output", {}).get("runs_dir", "runs"))
+    runs_dir = Path(cfg.get("output", {}).get("runs_dir", "../log"))
     # 让 runs 相对 MyModel3 根目录
     return ensure_dir(_PROJECT_ROOT / runs_dir)

@@ -87,6 +87,6 @@
 },
 
   "output": {
-    "runs_dir": "runs"
+    "runs_dir": "../log"
   }
 }

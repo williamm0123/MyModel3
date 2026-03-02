@@ -429,8 +429,8 @@ def main() -> None:
         default=-1,
         help="TensorBoard image log interval in steps; <=0 disables image logging to save memory",
     )
-    parser.add_argument("--tb_root", type=str, default="runs/tensorboard", help="TensorBoard root directory")
-    parser.add_argument("--ckpt_root", type=str, default="runs/checkpoints", help="Checkpoint root directory")
+    parser.add_argument("--tb_root", type=str, default="../log/tensorboard", help="TensorBoard root directory")
+    parser.add_argument("--ckpt_root", type=str, default="../log/checkpoints", help="Checkpoint root directory")
     parser.add_argument("--run_name", type=str, default="", help="TensorBoard run name")
     args = parser.parse_args()
 
