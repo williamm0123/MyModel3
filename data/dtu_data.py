@@ -142,6 +142,15 @@ class DTUData(Dataset):
         self.depth_source = ds.get("depth_source", auto["depth_source"])
         self.rectified_dir = rectified_dir
         self.image_source = auto["image_source"]
+        resize_hw = ds.get("resize_hw", None)
+        if resize_hw is None:
+            self.resize_hw: Optional[Tuple[int, int]] = None
+        else:
+            if not isinstance(resize_hw, (list, tuple)) or len(resize_hw) != 2:
+                raise ValueError(f"dataset.resize_hw must be [H, W], got: {resize_hw}")
+            self.resize_hw = (int(resize_hw[0]), int(resize_hw[1]))
+            if self.resize_hw[0] <= 0 or self.resize_hw[1] <= 0:
+                raise ValueError(f"dataset.resize_hw must be positive, got: {self.resize_hw}")
 
         # 3) DTU path helper (unified naming rules live here)
         self.paths = DTUPaths(cfg["datapath"], DTURules(img_tag=self.img_tag, img_ext=self.img_ext))
@@ -171,6 +180,7 @@ class DTUData(Dataset):
         scan, ref_view_idx = self.samples[idx]
         imgs: List[torch.Tensor] = []
         target_hw = None  # (H, W) determined by first view
+        orig_hw = None
 
         if self.sample_mode == "scan":
             view_indices = list(self.views)
@@ -184,14 +194,21 @@ class DTUData(Dataset):
                 raise FileNotFoundError(f"Image not found: {img_path}")
 
             pil = Image.open(img_path).convert("RGB")
+            if orig_hw is None:
+                orig_hw = (pil.height, pil.width)
 
             # pick target size from first image
-            if target_hw is None:
+            if self.resize_hw is not None:
+                target_hw = self.resize_hw
+            elif target_hw is None:
                 target_hw = (pil.height, pil.width)
             else:
                 # resize others to match
                 if (pil.height, pil.width) != target_hw:
                     pil = pil.resize((target_hw[1], target_hw[0]), resample=Image.BILINEAR)
+
+            if (pil.height, pil.width) != target_hw:
+                pil = pil.resize((target_hw[1], target_hw[0]), resample=Image.BILINEAR)
 
             img = np.array(pil, dtype=np.uint8)
             imgs.append(_to_tensor(img))
@@ -237,6 +254,12 @@ class DTUData(Dataset):
                 ext = np.eye(4, dtype=np.float32)
                 intr = np.array([[525, 0, W / 2], [0, 525, H / 2], [0, 0, 1]], dtype=np.float32)
                 d_min, d_max = 425.0, 905.0
+
+            if orig_hw is not None and (orig_hw[0] != H or orig_hw[1] != W):
+                sy = float(H) / float(orig_hw[0])
+                sx = float(W) / float(orig_hw[1])
+                intr[0, :] *= sx
+                intr[1, :] *= sy
 
             intrinsics.append(intr)
             extrinsics.append(ext)

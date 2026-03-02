@@ -54,6 +54,7 @@ class DinoCfg:
     weights: str = ""
     arch: str = "dinov3_vitb16"
     patch_size: int = 16
+    input_scale: float = 0.5
     use_imagenet_norm: bool = True
     pick_layers: Tuple[int, int, int] = (3, 7, 11)  # 1-based
     freeze: bool = True
@@ -170,7 +171,8 @@ class DINOv3Encoder(nn.Module):
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         x, _, _ = self.flatten_bv(images)
 
-        x = F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=False)
+        if float(self.cfg.input_scale) != 1.0:
+            x = F.interpolate(x, scale_factor=float(self.cfg.input_scale), mode="bilinear", align_corners=False)
         x = align_hw_multiple(x, int(self.cfg.patch_size))
         if self.cfg.use_imagenet_norm:
             x = imagenet_norm(x)

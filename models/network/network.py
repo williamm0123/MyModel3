@@ -68,6 +68,7 @@ class Network(nn.Module):
                 weights=str(d.get("weights", "")),
                 arch=str(d.get("arch", "dinov3_vitb16")),
                 patch_size=int(d.get("patch_size", 16)),
+                input_scale=float(d.get("input_scale", 0.5)),
                 use_imagenet_norm=bool(d.get("use_imagenet_norm", True)),
                 pick_layers=tuple(d.get("pick_layers", [3, 7, 11])),
                 freeze=bool(d.get("freeze", True)),
