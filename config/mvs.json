@@ -14,18 +14,21 @@
     "batch_size": 2,
     "num_workers": 4,
     "lr": 1e-5,
-    "weight_decay": 1e-6,
+    "weight_decay": 1e-5,
     "lr_scheduler": "cosine",
+    "warmup_steps": 800,
+    "lr_min_ratio": 0.2,
     "use_amp": true,
     "log_interval": 50,
     "save_interval": 1,
     "eval_interval": 1,
-    "grad_clip": 1.0
+    "grad_clip": 0.5
   },
 
   "loss": {
     "depth_types": ["reg", "reg", "reg", "reg"],
-    "loss_weights": [0.1, 0.2, 0.3, 0.4]
+    "loss_weights": [0.1, 0.2, 0.3, 0.4],
+    "clip_func": "dynamic"
   },
 
   "fpn": {

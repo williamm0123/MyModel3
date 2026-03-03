@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -787,6 +788,9 @@ def main() -> None:
         weight_decay = float(train_cfg.get("weight_decay", 1e-4))
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
         use_amp = bool(train_cfg.get("use_amp", True)) and (not args.no_amp)
+        lr_scheduler_name = str(train_cfg.get("lr_scheduler", "cosine")).lower()
+        warmup_steps_cfg = int(train_cfg.get("warmup_steps", 0))
+        lr_min_ratio = float(train_cfg.get("lr_min_ratio", 0.1))
 
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{local_rank}" if distributed else "cuda:0")
@@ -852,11 +856,28 @@ def main() -> None:
         optimizer = optim.AdamW(_unwrap_model(model).parameters(), lr=lr, weight_decay=weight_decay)
 
         steps_per_epoch = len(train_loader) if args.max_train_steps <= 0 else min(len(train_loader), args.max_train_steps)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, args.epochs * max(1, steps_per_epoch)),
-            eta_min=lr * 0.1,  # Changed from 0.01 to 0.1 for more stable training
-        )
+        total_train_steps = max(1, args.epochs * max(1, steps_per_epoch))
+        warmup_steps = max(0, min(warmup_steps_cfg, max(0, total_train_steps - 1)))
+        if lr_scheduler_name == "cosine":
+            if warmup_steps > 0:
+                def _warmup_cosine_lambda(step: int) -> float:
+                    if step < warmup_steps:
+                        return max(1e-6, float(step + 1) / float(max(1, warmup_steps)))
+                    progress = float(step - warmup_steps) / float(max(1, total_train_steps - warmup_steps))
+                    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    return lr_min_ratio + (1.0 - lr_min_ratio) * cosine
+
+                scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_warmup_cosine_lambda)
+            else:
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=total_train_steps,
+                    eta_min=lr * lr_min_ratio,
+                )
+        elif lr_scheduler_name in {"none", "constant"}:
+            scheduler = None
+        else:
+            raise ValueError(f"Unsupported train.lr_scheduler={lr_scheduler_name}. Use cosine/none.")
         scaler = GradScaler(device=device.type, enabled=(use_amp and device.type == "cuda"))
 
         run_name = args.run_name.strip()
@@ -892,6 +913,10 @@ def main() -> None:
             print("[TensorBoard] VSCode: Python: Launch TensorBoard -> select this logdir.")
             print(f"[Checkpoint] dir: {ckpt_dir}")
             print(f"Train batches (per-rank): {len(train_loader)} world_size={_get_world_size()}")
+            print(
+                f"[Scheduler] type={lr_scheduler_name} warmup_steps={warmup_steps} "
+                f"lr_min_ratio={lr_min_ratio:.4f}"
+            )
             if val_loader is not None:
                 print(f"Val batches (per-rank): {len(val_loader)}")
 
@@ -949,26 +974,14 @@ def main() -> None:
                     for key, value in val_stats.items():
                         writer.add_scalar(f"val_epoch/{key}", value, epoch)
                     if ("total" in train_stats) and ("total" in val_stats):
-                        writer.add_scalars(
-                            "loss/total_epoch_compare",
-                            {
-                                "train": float(train_stats["total"]),
-                                "val": float(val_stats["total"]),
-                            },
-                            epoch,
-                        )
+                        writer.add_scalar("loss/total_epoch_compare/train", float(train_stats["total"]), epoch)
+                        writer.add_scalar("loss/total_epoch_compare/val", float(val_stats["total"]), epoch)
                     # Also compare per-stage losses when both sides are available.
                     for key, train_value in train_stats.items():
                         if (key == "total") or (key not in val_stats):
                             continue
-                        writer.add_scalars(
-                            f"loss/{key}_epoch_compare",
-                            {
-                                "train": float(train_value),
-                                "val": float(val_stats[key]),
-                            },
-                            epoch,
-                        )
+                        writer.add_scalar(f"loss/{key}_epoch_compare/train", float(train_value), epoch)
+                        writer.add_scalar(f"loss/{key}_epoch_compare/val", float(val_stats[key]), epoch)
                 current_metric = float(val_stats.get("total", train_stats.get("total", float("inf"))))
             else:
                 current_metric = float(train_stats.get("total", float("inf")))
