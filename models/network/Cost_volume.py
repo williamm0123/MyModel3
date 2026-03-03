@@ -451,6 +451,10 @@ def init_inverse_range(depth_range: torch.Tensor, ndepths: int, H: int, W: int) 
     depth_min = depth_range[:, 0].view(B, 1, 1, 1)
     depth_max = depth_range[:, 1].view(B, 1, 1, 1)
     
+    # Add numerical stability protection
+    depth_min = torch.clamp(depth_min, min=0.01)
+    depth_max = torch.clamp(depth_max, min=0.01)
+    
     # Inverse depth (disparity)
     inv_min = 1.0 / depth_max
     inv_max = 1.0 / depth_min
@@ -458,6 +462,9 @@ def init_inverse_range(depth_range: torch.Tensor, ndepths: int, H: int, W: int) 
     # Linear in inverse space
     t = torch.linspace(0, 1, ndepths, device=device, dtype=dtype).view(1, -1, 1, 1)
     inv_depth = inv_min + t * (inv_max - inv_min)
+    
+    # Clamp inv_depth to avoid division by zero
+    inv_depth = torch.clamp(inv_depth, min=1e-6)
     
     depth_values = 1.0 / inv_depth
     depth_values = depth_values.expand(B, ndepths, H, W)
