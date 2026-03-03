@@ -835,7 +835,7 @@ def main() -> None:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=max(1, args.epochs * max(1, steps_per_epoch)),
-            eta_min=lr * 0.01,
+            eta_min=lr * 0.1,  # Changed from 0.01 to 0.1 for more stable training
         )
         scaler = GradScaler(device=device.type, enabled=(use_amp and device.type == "cuda"))
 

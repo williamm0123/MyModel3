@@ -66,26 +66,26 @@ def regression_loss(
     """
     mask = mask > 0.5
     
-    # Normalize by depth interval
-    if depth_interval is not None:
-        if depth_interval.dim() == 1:
-            depth_interval = depth_interval[:, None, None]
-        depth_pred = depth_pred / depth_interval
-        depth_gt = depth_gt / depth_interval
-    
     # Compute smooth L1 loss
     if not mask.any():
         return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
 
     loss = F.smooth_l1_loss(depth_pred[mask], depth_gt[mask], reduction='none')
     
+    # Normalize by depth interval AFTER computing the loss
+    # This keeps the loss magnitude reasonable
+    if depth_interval is not None:
+        if depth_interval.dim() == 1:
+            depth_interval = depth_interval[:, None, None]
+        # Apply normalization to the loss, not to the predictions/GT directly
+        loss = loss / depth_interval[mask]
+    
     # Dynamic clipping
     if clip_func == 'dynamic' and depth_values is not None:
         if inverse_depth:
             depth_values = torch.flip(depth_values, dims=[1])
         depth_range = (depth_values[:, -1] - depth_values[:, 0])
-        if depth_interval is not None:
-            depth_range = depth_range / depth_interval.squeeze(-1)
+        # Don't divide by depth_interval again since we already normalized the loss
         depth_range = depth_range[mask]
         loss = torch.clamp_max(loss, depth_range)
     
