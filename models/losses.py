@@ -64,56 +64,47 @@ def regression_loss(
     Returns:
         loss: scalar loss value
     """
-    B, H, W = depth_pred.shape
+    B = depth_pred.shape[0]
     mask_bool = mask > 0.5
-    
-    # NaN detection for numerical stability
-    if torch.isnan(depth_pred).any():
-        print("Warning: depth_pred contains NaN, returning zero loss")
-        return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
-    if torch.isnan(depth_gt).any():
-        print("Warning: depth_gt contains NaN, returning zero loss")
-        return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
-    
-    # Compute smooth L1 loss
-    if not mask_bool.any():
+    finite_mask = torch.isfinite(depth_pred) & torch.isfinite(depth_gt)
+    valid_mask = mask_bool & finite_mask
+
+    if not valid_mask.any():
         return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
 
-    loss = F.smooth_l1_loss(depth_pred[mask_bool], depth_gt[mask_bool], reduction='none')
-    
-    # Check for NaN in loss
-    if torch.isnan(loss).any():
-        print("Warning: loss contains NaN after computation, returning zero loss")
-        return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
-    
-    # Normalize by depth interval AFTER computing the loss
-    # This keeps the loss magnitude reasonable
+    safe_pred = torch.nan_to_num(depth_pred, nan=0.0, posinf=1e6, neginf=-1e6)
+    safe_gt = torch.nan_to_num(depth_gt, nan=0.0, posinf=1e6, neginf=-1e6)
+    loss_map = F.smooth_l1_loss(safe_pred, safe_gt, reduction='none')  # (B,H,W)
+
     if depth_interval is not None:
-        if depth_interval.dim() == 1:
-            # depth_interval: (B,) -> need to select per-pixel values
-            # Create per-pixel depth_interval using the mask
-            # Expand depth_interval to (B, H, W) then use mask to get (N,)
-            depth_interval_expanded = depth_interval.view(B, 1, 1).expand(B, H, W)
-            loss = loss / depth_interval_expanded[mask_bool]
-        elif depth_interval.dim() == 3:
-            # depth_interval: (B, 1, 1) -> expand to (B, H, W) then use mask
-            depth_interval_expanded = depth_interval.expand(B, H, W)
-            loss = loss / depth_interval_expanded[mask_bool]
-    
+        interval = depth_interval
+        if interval.dim() == 0:
+            interval = interval.view(1)
+        if interval.dim() == 1:
+            if interval.shape[0] == 1 and B > 1:
+                interval = interval.expand(B)
+            elif interval.shape[0] != B:
+                raise ValueError(f"depth_interval shape mismatch: got {tuple(interval.shape)} for batch={B}")
+            interval = interval.view(B, 1, 1)
+        else:
+            if interval.shape[0] != B:
+                if interval.shape[0] == 1 and B > 1:
+                    interval = interval.expand(B, *interval.shape[1:])
+                else:
+                    raise ValueError(f"depth_interval shape mismatch: got {tuple(interval.shape)} for batch={B}")
+            interval = interval.reshape(B, -1)[:, :1].view(B, 1, 1)
+        loss_map = loss_map / interval.clamp_min(1e-8)
+
     # Dynamic clipping
     if clip_func == 'dynamic' and depth_values is not None:
         if inverse_depth:
             depth_values = torch.flip(depth_values, dims=[1])
-        depth_range = (depth_values[:, -1] - depth_values[:, 0])  # (B,)
-        # Don't divide by depth_interval again since we already normalized the loss
-        if depth_range.dim() == 1:
-            depth_range_expanded = depth_range.view(B, 1, 1).expand(B, H, W)
-        else:
-            depth_range_expanded = depth_range.expand(B, H, W)
-        depth_range_selected = depth_range_expanded[mask_bool]
-        loss = torch.clamp_max(loss, depth_range_selected)
-    
-    return loss.mean()
+        depth_values = torch.nan_to_num(depth_values, nan=1.0, posinf=1e6, neginf=1e-3)
+        depth_range = (depth_values[:, -1] - depth_values[:, 0])  # (B,H,W)
+        depth_range = torch.nan_to_num(depth_range, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
+        loss_map = torch.minimum(loss_map, depth_range)
+
+    return loss_map[valid_mask].mean()
 
 
 # ============================================================

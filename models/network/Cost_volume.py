@@ -329,8 +329,15 @@ class VisibilityNet(nn.Module):
         Returns:
             vis_weight: (B, 1, H, W) visibility weights
         """
-        # Compute entropy along depth dimension
-        prob = F.softmax(cost_vol.mean(dim=1, keepdim=True), dim=2)  # (B, 1, D, H, W)
+        # Compute entropy along depth dimension with finite guards.
+        prob_logits = torch.nan_to_num(
+            cost_vol.mean(dim=1, keepdim=True),
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        )
+        prob = F.softmax(prob_logits, dim=2)  # (B, 1, D, H, W)
+        prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
         entropy = -(prob * torch.log(prob + 1e-6)).sum(dim=2)  # (B, 1, H, W)
         
         # Normalize entropy
@@ -338,6 +345,8 @@ class VisibilityNet(nn.Module):
         
         # Predict visibility (low entropy = high visibility)
         vis_weight = self.conv(1.0 - entropy_norm)
+        vis_weight = torch.nan_to_num(vis_weight, nan=0.0, posinf=1.0, neginf=0.0)
+        vis_weight = torch.clamp(vis_weight, 0.0, 1.0)
         
         return vis_weight
 
@@ -586,6 +595,8 @@ class StageNet(nn.Module):
     ) -> torch.Tensor:
         B, V, C, H, W = features.shape
         D = depth_values.shape[1]
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_values = torch.nan_to_num(depth_values, nan=1.0, posinf=1e4, neginf=1e-3).clamp_min(1e-3)
 
         ref_feat = features[:, 0]  # (B, C, H, W)
         src_feats = features[:, 1:]  # (B, V-1, C, H, W)
@@ -600,6 +611,7 @@ class StageNet(nn.Module):
             proj_full = proj_matrices.float()
         else:
             raise ValueError(f"Unsupported proj_matrices shape: {tuple(proj_matrices.shape)}")
+        proj_full = torch.nan_to_num(proj_full, nan=0.0, posinf=0.0, neginf=0.0)
 
         ref_proj = proj_full[:, 0]   # (B,4,4)
         src_projs = proj_full[:, 1:] # (B,V-1,4,4)
@@ -616,6 +628,7 @@ class StageNet(nn.Module):
             warped_feat, _ = homo_warping_3d_with_mask(
                 src_feat, src_proj_mat, ref_proj_mat, depth_values
             )
+            warped_feat = torch.nan_to_num(warped_feat, nan=0.0, posinf=0.0, neginf=0.0)
 
             if G < C:
                 warped_feat = warped_feat.view(B, G, C // G, D, H, W)
@@ -625,11 +638,13 @@ class StageNet(nn.Module):
                 ref_volume = ref_feat.view(B, G, 1, H, W).float()
                 cost_vol = ref_volume * warped_feat  # (B, C, D, H, W)
 
+            cost_vol = torch.nan_to_num(cost_vol, nan=0.0, posinf=0.0, neginf=0.0)
             vis_weight = self.vis_net(cost_vol)  # (B, 1, H, W)
             volume_sum = volume_sum + cost_vol * vis_weight.unsqueeze(2)
             vis_sum = vis_sum + vis_weight
 
-        return volume_sum / (vis_sum.unsqueeze(2) + 1e-6)
+        fused = volume_sum / (vis_sum.unsqueeze(2) + 1e-6)
+        return torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
     
     def forward(
         self,
@@ -655,11 +670,15 @@ class StageNet(nn.Module):
         B, V, C, H, W = features.shape
         D = depth_values.shape[1]
         cost_volume = self._build_fused_cost_volume(features, proj_matrices, depth_values)
+        cost_volume = torch.nan_to_num(cost_volume, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Cost regularization
         cost_reg = self.cost_reg(cost_volume)  # (B, 1, D, H, W)
-        prob_volume_pre = cost_reg.squeeze(1)  # (B, D, H, W)
+        prob_volume_pre = torch.nan_to_num(cost_reg.squeeze(1), nan=0.0, posinf=1e4, neginf=-1e4)
+        prob_volume_pre = torch.clamp(prob_volume_pre, min=-80.0, max=80.0)  # stable softmax logits
         prob_volume = F.softmax(prob_volume_pre, dim=1)
+        prob_volume = torch.nan_to_num(prob_volume, nan=0.0, posinf=1.0, neginf=0.0)
+        prob_volume = prob_volume / prob_volume.sum(dim=1, keepdim=True).clamp_min(1e-8)
         
         # Depth estimation
         if self.cfg.depth_type == "ce":
@@ -668,10 +687,10 @@ class StageNet(nn.Module):
                 _, idx = torch.max(prob_volume, dim=1)
                 depth = torch.gather(depth_values, 1, idx.unsqueeze(1)).squeeze(1)
             else:
-                depth = depth_regression(
-                    F.softmax(prob_volume_pre * temperature, dim=1),
-                    depth_values
-                )
+                infer_prob = F.softmax(prob_volume_pre * temperature, dim=1)
+                infer_prob = torch.nan_to_num(infer_prob, nan=0.0, posinf=1.0, neginf=0.0)
+                infer_prob = infer_prob / infer_prob.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                depth = depth_regression(infer_prob, depth_values)
             confidence = prob_volume.max(dim=1)[0]
         else:
             # Regression
@@ -686,6 +705,8 @@ class StageNet(nn.Module):
                 confidence = conf_regression(prob_volume, n=2)
             else:
                 confidence = prob_volume.max(dim=1)[0]
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        confidence = torch.nan_to_num(confidence, nan=0.0, posinf=1.0, neginf=0.0)
         
         return {
             'depth': depth,
