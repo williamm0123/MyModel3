@@ -1,9 +1,9 @@
 #!/bin/bash -l
 #SBATCH --job-name=mvs_01
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=gpu-v100s
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 #SBATCH --qos=long
 #SBATCH --time=3-0:0:0
 #SBATCH --output=logs/%x_%j.out
