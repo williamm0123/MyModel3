@@ -21,12 +21,14 @@ import builtins
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.utils import make_grid
 
 
 def _ensure_tensorboard_numpy_compat() -> None:
@@ -294,6 +296,46 @@ def _depth_to_image(depth: torch.Tensor) -> torch.Tensor:
     return image.unsqueeze(0)
 
 
+def _depth_to_image_range(
+    depth: torch.Tensor,
+    depth_min: float,
+    depth_max: float,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Convert depth (H,W) to a single-channel normalized image (1,H,W) using a fixed range.
+    """
+    if depth.dim() != 2:
+        raise ValueError(f"Expected depth dim=2, got {tuple(depth.shape)}")
+    denom = max(float(depth_max - depth_min), 1e-8)
+    image = (depth.float() - float(depth_min)) / denom
+    image = torch.clamp(image, 0.0, 1.0)
+    if valid_mask is not None:
+        if valid_mask.dim() != 2:
+            raise ValueError(f"Expected valid_mask dim=2, got {tuple(valid_mask.shape)}")
+        invalid = valid_mask <= 0.5
+        image = image.masked_fill(invalid, 0.0)
+    return image.unsqueeze(0)
+
+
+def _upsample_2d_to(
+    x_hw: torch.Tensor,
+    size_hw: Tuple[int, int],
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    """
+    Upsample a single 2D tensor (H,W) to size_hw and return (H2,W2).
+    """
+    if x_hw.dim() != 2:
+        raise ValueError(f"Expected (H,W), got {tuple(x_hw.shape)}")
+    return F.interpolate(
+        x_hw.unsqueeze(0).unsqueeze(0),
+        size=size_hw,
+        mode=mode,
+        align_corners=False if mode in {"bilinear", "bicubic"} else None,
+    ).squeeze(0).squeeze(0)
+
+
 def log_training_images(
     writer: Optional[SummaryWriter],
     batch: Dict[str, torch.Tensor],
@@ -306,9 +348,24 @@ def log_training_images(
     if writer is None:
         return
     images = batch["images"]
-    writer.add_image("train_images/ref_view", images[0, 0].detach().cpu().clamp(0, 1), global_step)
-    if images.shape[1] > 1:
-        writer.add_image("train_images/src_view1", images[0, 1].detach().cpu().clamp(0, 1), global_step)
+    # Log a grid of all views for the first sample (B=0).
+    views = images[0].detach().cpu().clamp(0, 1)  # (V,3,H,W)
+    writer.add_image("train_images/ref_view", views[0], global_step)
+    for v in range(1, min(int(views.shape[0]), 6)):
+        writer.add_image(f"train_images/src_view{v}", views[v], global_step)
+    try:
+        writer.add_image("train_images/views_grid", make_grid(views, nrow=int(views.shape[0])), global_step)
+    except Exception:
+        # Fallback to per-view images only.
+        pass
+
+    depth_gt = batch.get("depth_gt", None)
+    mask = batch.get("mask", None)
+    depth_range = batch.get("depth_range", None)
+    depth_min, depth_max = None, None
+    if depth_range is not None and depth_range.numel() >= 2:
+        depth_min = float(depth_range[0, 0].detach().cpu().item())
+        depth_max = float(depth_range[0, 1].detach().cpu().item())
 
     intermediates = outputs.get("intermediates", {})
     for stage_idx in range(1, 5):
@@ -329,22 +386,135 @@ def log_training_images(
                 global_step,
             )
 
+    # Pred depth per stage (stage1..4) and final depth.
+    # We treat stage{1..4} as the "different scales" (1/8, 1/4, 1/2, 1).
+    stage_pred_up: List[torch.Tensor] = []
+    stage_gt_up: List[torch.Tensor] = []
+    H_full, W_full = int(views.shape[-2]), int(views.shape[-1])
+    stage_scales = {1: "1_8", 2: "1_4", 3: "1_2", 4: "1_1"}
+
     for stage_idx in range(1, 5):
         stage_key = f"stage{stage_idx}"
         if stage_key in outputs and isinstance(outputs[stage_key], dict):
-            stage_depth = outputs[stage_key]["depth"][0].detach().cpu()
-            writer.add_image(
-                f"train_depth/stage{stage_idx}",
-                _depth_to_image(stage_depth),
-                global_step,
-            )
+            stage_depth = outputs[stage_key]["depth"][0].detach().cpu()  # (H_s,W_s)
+            stage_conf = outputs[stage_key].get("photometric_confidence", None)
+            stage_conf = None if stage_conf is None else stage_conf[0].detach().cpu()
+
+            tag_scale = stage_scales.get(stage_idx, f"stage{stage_idx}")
+            if depth_min is not None and depth_max is not None:
+                writer.add_image(
+                    f"train_depth/pred_stage{stage_idx}_{tag_scale}",
+                    _depth_to_image_range(stage_depth, depth_min, depth_max),
+                    global_step,
+                )
+                # Backward-compatible tag.
+                writer.add_image(
+                    f"train_depth/stage{stage_idx}",
+                    _depth_to_image_range(stage_depth, depth_min, depth_max),
+                    global_step,
+                )
+            else:
+                writer.add_image(
+                    f"train_depth/pred_stage{stage_idx}_{tag_scale}",
+                    _depth_to_image(stage_depth),
+                    global_step,
+                )
+                writer.add_image(
+                    f"train_depth/stage{stage_idx}",
+                    _depth_to_image(stage_depth),
+                    global_step,
+                )
+            if stage_conf is not None:
+                writer.add_image(
+                    f"train_depth/conf_stage{stage_idx}_{tag_scale}",
+                    _normalize_for_vis(stage_conf).unsqueeze(0),
+                    global_step,
+                )
+
+            # Upsampled-to-full-res grid for quick comparison across stages.
+            stage_depth_up = _upsample_2d_to(stage_depth, (H_full, W_full), mode="bilinear")
+            stage_pred_up.append(stage_depth_up)
+
+            if depth_gt is not None:
+                gt_full = depth_gt[0].detach().cpu()
+                gt_stage = _upsample_2d_to(gt_full, tuple(stage_depth.shape), mode="bilinear")
+                stage_gt_up.append(_upsample_2d_to(gt_stage, (H_full, W_full), mode="bilinear"))
+
+                # Per-stage error at native stage resolution.
+                if mask is not None:
+                    mask_full = mask[0].detach().cpu()
+                    mask_stage = _upsample_2d_to(mask_full, tuple(stage_depth.shape), mode="nearest")
+                else:
+                    mask_stage = None
+                err = (stage_depth - gt_stage).abs()
+                if mask_stage is not None:
+                    err = err.masked_fill(mask_stage <= 0.5, 0.0)
+                writer.add_image(
+                    f"train_depth/abs_err_stage{stage_idx}_{tag_scale}",
+                    _normalize_for_vis(err).unsqueeze(0),
+                    global_step,
+                )
 
     if "depth" in outputs:
-        writer.add_image(
-            "train_depth/final",
-            _depth_to_image(outputs["depth"][0].detach().cpu()),
-            global_step,
-        )
+        pred_full = outputs["depth"][0].detach().cpu()
+        if depth_min is not None and depth_max is not None:
+            writer.add_image(
+                "train_depth/pred_final",
+                _depth_to_image_range(pred_full, depth_min, depth_max),
+                global_step,
+            )
+            writer.add_image(
+                "train_depth/final",
+                _depth_to_image_range(pred_full, depth_min, depth_max),
+                global_step,
+            )
+        else:
+            writer.add_image("train_depth/pred_final", _depth_to_image(pred_full), global_step)
+            writer.add_image("train_depth/final", _depth_to_image(pred_full), global_step)
+
+        if depth_gt is not None:
+            gt_full = depth_gt[0].detach().cpu()
+            if mask is not None:
+                mask_full = mask[0].detach().cpu()
+            else:
+                mask_full = None
+
+            if depth_min is not None and depth_max is not None:
+                writer.add_image(
+                    "train_depth/gt_final",
+                    _depth_to_image_range(gt_full, depth_min, depth_max, valid_mask=mask_full),
+                    global_step,
+                )
+            else:
+                writer.add_image("train_depth/gt_final", _depth_to_image(gt_full), global_step)
+
+            err = (pred_full - gt_full).abs()
+            if mask_full is not None:
+                err = err.masked_fill(mask_full <= 0.5, 0.0)
+                writer.add_image("train_depth/mask_final", mask_full.unsqueeze(0).float(), global_step)
+            writer.add_image("train_depth/abs_err_final", _normalize_for_vis(err).unsqueeze(0), global_step)
+
+    # Stage prediction grids (upsampled to full resolution so they tile nicely).
+    if len(stage_pred_up) == 4:
+        pred_stack = torch.stack(stage_pred_up, dim=0).unsqueeze(1)  # (4,1,H,W)
+        try:
+            writer.add_image(
+                "train_depth/pred_stages_up_grid",
+                make_grid(pred_stack, nrow=2),
+                global_step,
+            )
+        except Exception:
+            pass
+    if len(stage_gt_up) == 4:
+        gt_stack = torch.stack(stage_gt_up, dim=0).unsqueeze(1)  # (4,1,H,W)
+        try:
+            writer.add_image(
+                "train_depth/gt_stages_up_grid",
+                make_grid(gt_stack, nrow=2),
+                global_step,
+            )
+        except Exception:
+            pass
 
 
 def save_checkpoint(
@@ -400,6 +570,7 @@ def train_one_epoch(
     grad_clip: float,
     log_interval: int,
     image_log_interval: int,
+    log_intermediates: bool,
     max_steps: int,
     global_step: int,
     scheduler: Optional[optim.lr_scheduler._LRScheduler],
@@ -424,10 +595,11 @@ def train_one_epoch(
             and (image_log_interval > 0)
             and (global_step % image_log_interval == 0)
         )
+        request_intermediate = bool(should_log_images and log_intermediates)
 
         if scaler is not None:
             with autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(images, proj_matrices, depth_range, return_intermediate=should_log_images)
+                outputs = model(images, proj_matrices, depth_range, return_intermediate=request_intermediate)
                 loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
                 total_loss = loss_dict["total"]
             scaler.scale(total_loss).backward()
@@ -440,7 +612,7 @@ def train_one_epoch(
             if scheduler is not None and scaler.get_scale() >= prev_scale:
                 scheduler.step()
         else:
-            outputs = model(images, proj_matrices, depth_range, return_intermediate=should_log_images)
+            outputs = model(images, proj_matrices, depth_range, return_intermediate=request_intermediate)
             loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
             total_loss = loss_dict["total"]
             total_loss.backward()
@@ -458,6 +630,9 @@ def train_one_epoch(
             total_stats[key] = total_stats.get(key, 0.0) + value
             if writer is not None:
                 writer.add_scalar(f"train/{key}", value, global_step)
+        if writer is not None and "total" in step_stats:
+            # Dedicated loss curve tags for easier TensorBoard filtering.
+            writer.add_scalar("loss/train_total_step", step_stats["total"], global_step)
 
         if writer is not None:
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
@@ -466,6 +641,9 @@ def train_one_epoch(
         if should_log_images:
             cpu_batch = {
                 "images": images.detach().cpu(),
+                "depth_gt": depth_gt.detach().cpu(),
+                "mask": mask.detach().cpu(),
+                "depth_range": depth_range.detach().cpu(),
             }
             log_training_images(writer, cpu_batch, outputs, global_step)
 
@@ -551,6 +729,11 @@ def main() -> None:
         type=int,
         default=-1,
         help="TensorBoard image log interval in steps; <=0 disables image logging to save memory",
+    )
+    parser.add_argument(
+        "--log_intermediates",
+        action="store_true",
+        help="Also request and log network intermediate features (higher memory); off by default",
     )
     parser.add_argument("--tb_root", type=str, default="../log/tensorboard", help="TensorBoard root directory")
     parser.add_argument("--ckpt_root", type=str, default="../log/checkpoints", help="Checkpoint root directory")
@@ -718,6 +901,7 @@ def main() -> None:
                 grad_clip=grad_clip,
                 log_interval=max(1, args.log_interval),
                 image_log_interval=args.image_log_interval,
+                log_intermediates=args.log_intermediates,
                 max_steps=args.max_train_steps,
                 global_step=global_step,
                 scheduler=scheduler,
@@ -727,6 +911,8 @@ def main() -> None:
             if writer is not None:
                 for key, value in train_stats.items():
                     writer.add_scalar(f"train_epoch/{key}", value, epoch)
+                if "total" in train_stats:
+                    writer.add_scalar("loss/train_total_epoch", float(train_stats["total"]), epoch)
 
             if val_loader is not None:
                 val_stats = evaluate_one_epoch(
@@ -742,6 +928,27 @@ def main() -> None:
                 if writer is not None:
                     for key, value in val_stats.items():
                         writer.add_scalar(f"val_epoch/{key}", value, epoch)
+                    if ("total" in train_stats) and ("total" in val_stats):
+                        writer.add_scalars(
+                            "loss/total_epoch_compare",
+                            {
+                                "train": float(train_stats["total"]),
+                                "val": float(val_stats["total"]),
+                            },
+                            epoch,
+                        )
+                    # Also compare per-stage losses when both sides are available.
+                    for key, train_value in train_stats.items():
+                        if (key == "total") or (key not in val_stats):
+                            continue
+                        writer.add_scalars(
+                            f"loss/{key}_epoch_compare",
+                            {
+                                "train": float(train_value),
+                                "val": float(val_stats[key]),
+                            },
+                            epoch,
+                        )
                 current_metric = float(val_stats.get("total", train_stats.get("total", float("inf"))))
             else:
                 current_metric = float(train_stats.get("total", float("inf")))
