@@ -11,21 +11,21 @@
 
   "train": {
     "epochs": 16,
-    "batch_size": 5,
+    "batch_size": 2,
     "num_workers": 4,
-    "lr": 5e-5,
-    "weight_decay": 1e-5,
+    "lr": 1e-5,
+    "weight_decay": 1e-6,
     "lr_scheduler": "cosine",
     "use_amp": true,
     "log_interval": 50,
     "save_interval": 1,
     "eval_interval": 1,
-    "grad_clip": 5.0
+    "grad_clip": 1.0
   },
 
   "loss": {
     "depth_types": ["reg", "reg", "reg", "reg"],
-    "loss_weights": [0.25, 0.5, 0.75, 1.0]
+    "loss_weights": [0.1, 0.2, 0.3, 0.4]
   },
 
   "fpn": {

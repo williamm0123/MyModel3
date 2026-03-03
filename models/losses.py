@@ -67,11 +67,24 @@ def regression_loss(
     B, H, W = depth_pred.shape
     mask_bool = mask > 0.5
     
+    # NaN detection for numerical stability
+    if torch.isnan(depth_pred).any():
+        print("Warning: depth_pred contains NaN, returning zero loss")
+        return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
+    if torch.isnan(depth_gt).any():
+        print("Warning: depth_gt contains NaN, returning zero loss")
+        return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
+    
     # Compute smooth L1 loss
     if not mask_bool.any():
         return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
 
     loss = F.smooth_l1_loss(depth_pred[mask_bool], depth_gt[mask_bool], reduction='none')
+    
+    # Check for NaN in loss
+    if torch.isnan(loss).any():
+        print("Warning: loss contains NaN after computation, returning zero loss")
+        return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
     
     # Normalize by depth interval AFTER computing the loss
     # This keeps the loss magnitude reasonable

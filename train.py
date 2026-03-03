@@ -602,6 +602,16 @@ def train_one_epoch(
                 outputs = model(images, proj_matrices, depth_range, return_intermediate=request_intermediate)
                 loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
                 total_loss = loss_dict["total"]
+            
+            # Check for NaN/Inf in loss before backward
+            if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+                if _is_main_process():
+                    print(f"[WARNING] Step {step_idx}: Loss is NaN/Inf, skipping this step...")
+                optimizer.zero_grad(set_to_none=True)
+                num_steps += 1
+                global_step += 1
+                continue
+            
             scaler.scale(total_loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -615,6 +625,16 @@ def train_one_epoch(
             outputs = model(images, proj_matrices, depth_range, return_intermediate=request_intermediate)
             loss_dict = loss_fn(outputs, depth_gt_ms, mask_ms, depth_interval)
             total_loss = loss_dict["total"]
+            
+            # Check for NaN/Inf in loss before backward
+            if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+                if _is_main_process():
+                    print(f"[WARNING] Step {step_idx}: Loss is NaN/Inf, skipping this step...")
+                optimizer.zero_grad(set_to_none=True)
+                num_steps += 1
+                global_step += 1
+                continue
+            
             total_loss.backward()
             if grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
