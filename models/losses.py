@@ -64,30 +64,41 @@ def regression_loss(
     Returns:
         loss: scalar loss value
     """
-    mask = mask > 0.5
+    B, H, W = depth_pred.shape
+    mask_bool = mask > 0.5
     
     # Compute smooth L1 loss
-    if not mask.any():
+    if not mask_bool.any():
         return torch.tensor(0.0, device=depth_pred.device, requires_grad=True)
 
-    loss = F.smooth_l1_loss(depth_pred[mask], depth_gt[mask], reduction='none')
+    loss = F.smooth_l1_loss(depth_pred[mask_bool], depth_gt[mask_bool], reduction='none')
     
     # Normalize by depth interval AFTER computing the loss
     # This keeps the loss magnitude reasonable
     if depth_interval is not None:
         if depth_interval.dim() == 1:
-            depth_interval = depth_interval[:, None, None]
-        # Apply normalization to the loss, not to the predictions/GT directly
-        loss = loss / depth_interval[mask]
+            # depth_interval: (B,) -> need to select per-pixel values
+            # Create per-pixel depth_interval using the mask
+            # Expand depth_interval to (B, H, W) then use mask to get (N,)
+            depth_interval_expanded = depth_interval.view(B, 1, 1).expand(B, H, W)
+            loss = loss / depth_interval_expanded[mask_bool]
+        elif depth_interval.dim() == 3:
+            # depth_interval: (B, 1, 1) -> expand to (B, H, W) then use mask
+            depth_interval_expanded = depth_interval.expand(B, H, W)
+            loss = loss / depth_interval_expanded[mask_bool]
     
     # Dynamic clipping
     if clip_func == 'dynamic' and depth_values is not None:
         if inverse_depth:
             depth_values = torch.flip(depth_values, dims=[1])
-        depth_range = (depth_values[:, -1] - depth_values[:, 0])
+        depth_range = (depth_values[:, -1] - depth_values[:, 0])  # (B,)
         # Don't divide by depth_interval again since we already normalized the loss
-        depth_range = depth_range[mask]
-        loss = torch.clamp_max(loss, depth_range)
+        if depth_range.dim() == 1:
+            depth_range_expanded = depth_range.view(B, 1, 1).expand(B, H, W)
+        else:
+            depth_range_expanded = depth_range.expand(B, H, W)
+        depth_range_selected = depth_range_expanded[mask_bool]
+        loss = torch.clamp_max(loss, depth_range_selected)
     
     return loss.mean()
 
@@ -332,19 +343,27 @@ if __name__ == "__main__":
     mask = torch.ones(B, H, W, device=device)
     depth_interval = torch.tensor([0.1, 0.1], device=device)
     
-    # Test regression loss
+    # Test regression loss with fix
+    print("\n=== Testing regression_loss with depth_interval normalization ===")
     reg_loss = regression_loss(depth_pred, depth_gt, mask, depth_interval)
     print(f"Regression loss: {reg_loss.item():.6f}")
+    
+    # Test with partial mask
+    print("\n=== Testing with partial mask ===")
+    partial_mask = torch.zeros(B, H, W, device=device)
+    partial_mask[:, :H//2, :W//2] = 1.0
+    reg_loss_partial = regression_loss(depth_pred, depth_gt, partial_mask, depth_interval)
+    print(f"Regression loss (partial mask): {reg_loss_partial.item():.6f}")
     
     # Test cross-entropy loss
     prob_volume_pre = torch.randn(B, D, H, W, device=device)
     depth_values = torch.linspace(0.5, 10.5, D, device=device).view(1, D, 1, 1).expand(B, D, H, W)
     
     ce_loss = cross_entropy_loss(prob_volume_pre, depth_values, depth_gt, mask)
-    print(f"Cross-entropy loss: {ce_loss.item():.6f}")
+    print(f"\nCross-entropy loss: {ce_loss.item():.6f}")
     
     # Test multi-stage loss
-    print("\nTesting MultiStageLoss...")
+    print("\n=== Testing MultiStageLoss ===")
     
     cfg = LossCfg()
     loss_fn = MultiStageLoss(cfg).to(device)
@@ -374,4 +393,4 @@ if __name__ == "__main__":
     for k, v in loss_dict.items():
         print(f"  {k}: {v.item():.6f}")
     
-    print("\nAll tests passed!")
+    print("\n✅ All tests passed!")
