@@ -862,7 +862,7 @@ def main() -> None:
             if warmup_steps > 0:
                 def _warmup_cosine_lambda(step: int) -> float:
                     if step < warmup_steps:
-                        return max(1e-6, float(step + 1) / float(max(1, warmup_steps)))
+                        return float(step) / float(max(1, warmup_steps))
                     progress = float(step - warmup_steps) / float(max(1, total_train_steps - warmup_steps))
                     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
                     return lr_min_ratio + (1.0 - lr_min_ratio) * cosine

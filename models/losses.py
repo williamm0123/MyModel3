@@ -74,8 +74,8 @@ def regression_loss(
 
     safe_pred = torch.nan_to_num(depth_pred, nan=0.0, posinf=1e6, neginf=-1e6)
     safe_gt = torch.nan_to_num(depth_gt, nan=0.0, posinf=1e6, neginf=-1e6)
-    loss_map = F.smooth_l1_loss(safe_pred, safe_gt, reduction='none')  # (B,H,W)
 
+    interval = None
     if depth_interval is not None:
         interval = depth_interval
         if interval.dim() == 0:
@@ -93,7 +93,12 @@ def regression_loss(
                 else:
                     raise ValueError(f"depth_interval shape mismatch: got {tuple(interval.shape)} for batch={B}")
             interval = interval.reshape(B, -1)[:, :1].view(B, 1, 1)
-        loss_map = loss_map / interval.clamp_min(1e-8)
+        interval = interval.clamp_min(1e-8)
+        # Align with official MVSFormer++: normalize depth by interval before SmoothL1.
+        safe_pred = safe_pred / interval
+        safe_gt = safe_gt / interval
+
+    loss_map = F.smooth_l1_loss(safe_pred, safe_gt, reduction='none')  # (B,H,W)
 
     # Dynamic clipping
     if clip_func == 'dynamic' and depth_values is not None:
@@ -101,6 +106,8 @@ def regression_loss(
             depth_values = torch.flip(depth_values, dims=[1])
         depth_values = torch.nan_to_num(depth_values, nan=1.0, posinf=1e6, neginf=1e-3)
         depth_range = (depth_values[:, -1] - depth_values[:, 0])  # (B,H,W)
+        if interval is not None:
+            depth_range = depth_range / interval
         depth_range = torch.nan_to_num(depth_range, nan=0.0, posinf=1e6, neginf=0.0).clamp_min(0.0)
         loss_map = torch.minimum(loss_map, depth_range)
 
