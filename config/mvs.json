@@ -3,6 +3,7 @@
   "mode": "train",
 
   "datapath": "${DATA_ROOT}/dataset/DTU/dtu_training/",
+  "DATA_ROOT":"/scr/user/qinglong",
   "train_data_list": "lists/dtu/train.txt",
   "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",
