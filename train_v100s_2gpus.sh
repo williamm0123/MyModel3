@@ -15,7 +15,5 @@ mkdir -p logs
 source ~/.bashrc
 conda activate mvs
 
-DATA_ROOT=/scr/user/qinglong CUDA_VISIBLE_DEVICES=0,1 \
-python -u train.py --config config/mvsformer++.json \
-  --exp_name MVSFormerpp01 \
-  --DDP
+export DATA_ROOT=/scr/user/qinglong
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py --config config/mvs.json
