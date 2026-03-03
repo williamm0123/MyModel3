@@ -1,27 +1,21 @@
 #!/bin/bash -l
-#SBATCH --job-name=MyModel3_pipeline
-#SBATCH --partition=gpu-v100s
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
+#SBATCH --job-name=mvs_01
+#SBATCH --partition=gpu-a100
 #SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 #SBATCH --qos=long
-#SBATCH --time=3-00:00:00
+#SBATCH --time=3-0:0:0
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
 set -euo pipefail
-
-# 1) 确保日志目录存在（否则可能直接退出）
 mkdir -p logs
 
-echo "JobID=$SLURM_JOB_ID on $(hostname -s)"
-date
-nvidia-smi || true
+source ~/.bashrc
+conda activate mvs
 
-# 2) 你的运行指令
-export DATA_ROOT=/scr/user/qinglong
-export CUDA_VISIBLE_DEVICES=0,1
-
-python -u train.py --config config/mvs.json
+DATA_ROOT=/scr/user/qinglong CUDA_VISIBLE_DEVICES=0,1 \
+python -u train.py --config config/mvsformer++.json \
+  --exp_name MVSFormerpp01 \
+  --DDP
