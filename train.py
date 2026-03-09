@@ -10,6 +10,7 @@ Default behavior is debug-friendly:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -133,6 +134,160 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _wrap_ddp(
+    model: nn.Module,
+    local_rank: int,
+    *,
+    find_unused_parameters: bool,
+    static_graph: bool,
+) -> nn.Module:
+    """
+    Wrap model with DDP using performant defaults while keeping compatibility
+    across PyTorch versions.
+    """
+    ddp_kwargs: Dict[str, Any] = {
+        "device_ids": [local_rank],
+        "output_device": local_rank,
+        "find_unused_parameters": find_unused_parameters,
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+    }
+    ddp_sig = inspect.signature(DDP.__init__)
+    if static_graph and ("static_graph" in ddp_sig.parameters):
+        ddp_kwargs["static_graph"] = True
+    return DDP(model, **ddp_kwargs)
+
+
+def _normalize_depth_type(depth_type: Any) -> str:
+    """Normalize depth type aliases to {'ce', 'reg'}."""
+    key = str(depth_type).strip().lower()
+    mapping = {
+        "ce": "ce",
+        "cross_entropy": "ce",
+        "cross-entropy": "ce",
+        "classification": "ce",
+        "cls": "ce",
+        "reg": "reg",
+        "re": "reg",
+        "regression": "reg",
+        "l1": "reg",
+        "smooth_l1": "reg",
+        "smoothl1": "reg",
+    }
+    if key not in mapping:
+        raise ValueError(f"Unsupported depth type: {depth_type}")
+    return mapping[key]
+
+
+def _to_stage_list(raw: Any, *, default: Any, nstage: int = 4) -> List[Any]:
+    if raw is None:
+        values = [default]
+    elif isinstance(raw, (list, tuple)):
+        values = list(raw)
+    else:
+        values = [raw]
+    if len(values) == 0:
+        values = [default]
+    if len(values) < nstage:
+        values = values + [values[-1]] * (nstage - len(values))
+    else:
+        values = values[:nstage]
+    return values
+
+
+def _normalize_model_and_loss_cfg(cfg_dict: Dict[str, Any]) -> None:
+    """
+    Normalize/align model depth type and loss depth types.
+    This prevents silent mismatch across different config schemas.
+    """
+    loss_cfg = dict(cfg_dict.get("loss", {}))
+    depth_cfg = dict(cfg_dict.get("depth", {}))
+    arch_cfg = cfg_dict.get("arch", {})
+    arch_args = arch_cfg.get("args", {}) if isinstance(arch_cfg, dict) else {}
+    arch_loss = arch_cfg.get("loss", {}) if isinstance(arch_cfg, dict) else {}
+
+    # Fill missing depth config from common legacy keys.
+    if "inverse_depth" not in depth_cfg:
+        depth_cfg["inverse_depth"] = bool(arch_args.get("inverse_depth", True))
+    if "ndepths" not in depth_cfg and isinstance(arch_args.get("ndepths"), (list, tuple)):
+        depth_cfg["ndepths"] = list(arch_args["ndepths"])
+    if "depth_interval_ratios" not in depth_cfg and isinstance(arch_args.get("depth_interals_ratio"), (list, tuple)):
+        depth_cfg["depth_interval_ratios"] = list(arch_args["depth_interals_ratio"])
+
+    if "base_chs" not in depth_cfg:
+        fpn_cfg = cfg_dict.get("fpn", {})
+        feat_chs = fpn_cfg.get("feat_chs") if isinstance(fpn_cfg, dict) else None
+        if isinstance(feat_chs, (list, tuple)) and len(feat_chs) >= 4:
+            depth_cfg["base_chs"] = [int(feat_chs[3]), int(feat_chs[2]), int(feat_chs[1]), int(feat_chs[0])]
+
+    # Resolve model depth type from depth/loss/legacy keys.
+    model_depth_raw = depth_cfg.get("depth_type", None)
+    if model_depth_raw is None:
+        model_depth_raw = loss_cfg.get("depth_type", None)
+    if model_depth_raw is None:
+        model_depth_raw = arch_args.get("depth_type", None)
+    if isinstance(model_depth_raw, (list, tuple)):
+        model_depth_raw = model_depth_raw[0] if len(model_depth_raw) > 0 else None
+
+    # Resolve loss depth types from loss/depth/legacy keys.
+    loss_depth_raw = loss_cfg.get("depth_types", None)
+    if loss_depth_raw is None:
+        loss_depth_raw = loss_cfg.get("depth_type", None)
+    if loss_depth_raw is None:
+        loss_depth_raw = model_depth_raw
+    if loss_depth_raw is None:
+        loss_depth_raw = arch_args.get("depth_type", None)
+
+    loss_depth_types = [_normalize_depth_type(v) for v in _to_stage_list(loss_depth_raw, default="ce", nstage=4)]
+    # Current depth estimator only supports a single depth type across stages.
+    if len(set(loss_depth_types)) != 1:
+        loss_depth_types = [loss_depth_types[0]] * 4
+
+    model_depth_norm = _normalize_depth_type(model_depth_raw) if model_depth_raw is not None else loss_depth_types[0]
+    if model_depth_norm != loss_depth_types[0]:
+        # Enforce consistency: use the loss type as source of truth.
+        model_depth_norm = loss_depth_types[0]
+
+    # Resolve loss weights (support both loss_weights and legacy dlossw).
+    loss_weights_raw = loss_cfg.get("loss_weights", None)
+    if loss_weights_raw is None:
+        loss_weights_raw = loss_cfg.get("dlossw", None)
+    if loss_weights_raw is None and isinstance(arch_loss, dict):
+        loss_weights_raw = arch_loss.get("dlossw", None)
+    loss_weights = [float(v) for v in _to_stage_list(loss_weights_raw, default=1.0, nstage=4)]
+
+    if "clip_func" not in loss_cfg and isinstance(arch_loss, dict) and ("clip_func" in arch_loss):
+        loss_cfg["clip_func"] = arch_loss.get("clip_func")
+
+    loss_cfg["depth_types"] = loss_depth_types
+    loss_cfg["loss_weights"] = loss_weights
+    depth_cfg["depth_type"] = "ce" if model_depth_norm == "ce" else "regression"
+
+    cfg_dict["loss"] = loss_cfg
+    cfg_dict["depth"] = depth_cfg
+
+
+def _build_optimizer(model: nn.Module, lr: float, weight_decay: float) -> optim.Optimizer:
+    """AdamW with no-weight-decay for bias/norm/1D parameters."""
+    decay_params: List[nn.Parameter] = []
+    no_decay_params: List[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        name_l = name.lower()
+        if param.ndim <= 1 or name_l.endswith(".bias") or ("norm" in name_l) or ("bn" in name_l):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    param_groups: List[Dict[str, Any]] = []
+    if decay_params:
+        param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return optim.AdamW(param_groups, lr=lr)
+
+
 def _all_reduce_epoch_stats(
     total_stats: Dict[str, float],
     num_steps: int,
@@ -173,12 +328,18 @@ class MVSModel(nn.Module):
         super().__init__()
         self.network = Network(cfg_dict, device=device)
         depth_cfg = cfg_dict.get("depth", {})
+        depth_type_norm = _normalize_depth_type(depth_cfg.get("depth_type", "ce"))
+        ndepths = tuple(int(v) for v in _to_stage_list(depth_cfg.get("ndepths", [32, 16, 8, 4]), default=4, nstage=4))
+        base_chs = tuple(int(v) for v in _to_stage_list(depth_cfg.get("base_chs", [64, 32, 16, 8]), default=8, nstage=4))
+        depth_interval_ratios = tuple(
+            float(v) for v in _to_stage_list(depth_cfg.get("depth_interval_ratios", [4.0, 2.67, 1.5, 1.0]), default=1.0, nstage=4)
+        )
         self.depth_estimator = DepthEstimator(DepthEstimatorCfg(
-            ndepths=tuple(depth_cfg.get("ndepths", [32, 16, 8, 4])),
-            base_chs=tuple(depth_cfg.get("base_chs", [64, 32, 16, 8])),
-            depth_interval_ratios=tuple(depth_cfg.get("depth_interval_ratios", [4.0, 2.0, 1.0, 0.5])),
+            ndepths=ndepths,
+            base_chs=base_chs,
+            depth_interval_ratios=depth_interval_ratios,
             inverse_depth=depth_cfg.get("inverse_depth", True),
-            depth_type=depth_cfg.get("depth_type", "regression"),
+            depth_type="ce" if depth_type_norm == "ce" else "regression",
             temperatures=tuple(depth_cfg.get("temperatures", [5.0, 5.0, 5.0, 1.0])),
         ))
 
@@ -253,9 +414,11 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Tuple[t
 def build_loss_fn(cfg_dict: Dict[str, Any]) -> MultiStageLoss:
     loss_cfg = cfg_dict.get("loss", {})
     depth_cfg = cfg_dict.get("depth", {})
+    depth_types = tuple(_normalize_depth_type(v) for v in _to_stage_list(loss_cfg.get("depth_types"), default="ce", nstage=4))
+    loss_weights = tuple(float(v) for v in _to_stage_list(loss_cfg.get("loss_weights"), default=1.0, nstage=4))
     return MultiStageLoss(LossCfg(
-        depth_types=tuple(loss_cfg.get("depth_types", ["reg", "reg", "reg", "reg"])),
-        loss_weights=tuple(loss_cfg.get("loss_weights", [1.0, 1.0, 1.0, 1.0])),
+        depth_types=depth_types,
+        loss_weights=loss_weights,
         inverse_depth=depth_cfg.get("inverse_depth", True),
         clip_func=loss_cfg.get("clip_func", None),
     ))
@@ -759,6 +922,16 @@ def main() -> None:
     parser.add_argument("--tb_root", type=str, default="../log/tensorboard", help="TensorBoard root directory")
     parser.add_argument("--ckpt_root", type=str, default="../log/checkpoints", help="Checkpoint root directory")
     parser.add_argument("--run_name", type=str, default="", help="TensorBoard run name")
+    parser.add_argument(
+        "--find_unused_parameters",
+        action="store_true",
+        help="Enable DDP unused-parameter detection (slower; only use when needed).",
+    )
+    parser.add_argument(
+        "--no_static_graph",
+        action="store_true",
+        help="Disable DDP static_graph optimization.",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
@@ -781,6 +954,9 @@ def main() -> None:
         if args.data_root:
             cfg_dict["datapath"] = args.data_root
 
+        # Keep model depth type and loss depth types consistent across config variants.
+        _normalize_model_and_loss_cfg(cfg_dict)
+
         train_cfg = cfg_dict["train"]
         batch_size = int(train_cfg.get("batch_size", 1))
         num_workers = int(train_cfg.get("num_workers", 2))
@@ -791,9 +967,14 @@ def main() -> None:
         lr_scheduler_name = str(train_cfg.get("lr_scheduler", "cosine")).lower()
         warmup_steps_cfg = int(train_cfg.get("warmup_steps", 0))
         lr_min_ratio = float(train_cfg.get("lr_min_ratio", 0.1))
+        short_cosine_steps = int(train_cfg.get("short_cosine_steps", 2000))
+        short_cosine_lr_floor = float(train_cfg.get("short_cosine_lr_floor", 0.2))
+        short_cosine_warmup_ratio = float(train_cfg.get("short_cosine_warmup_ratio", 0.1))
+        persistent_workers_cfg = bool(train_cfg.get("persistent_workers", True))
 
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{local_rank}" if distributed else "cuda:0")
+            torch.backends.cudnn.benchmark = True
         else:
             device = torch.device("cpu")
 
@@ -832,6 +1013,7 @@ def main() -> None:
             sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=(device.type == "cuda"),
+            persistent_workers=(persistent_workers_cfg and num_workers > 0),
             drop_last=True,
         )
         val_loader = None if val_dataset is None else DataLoader(
@@ -841,23 +1023,31 @@ def main() -> None:
             sampler=val_sampler,
             num_workers=num_workers,
             pin_memory=(device.type == "cuda"),
+            persistent_workers=(persistent_workers_cfg and num_workers > 0),
         )
 
         model: nn.Module = MVSModel(cfg_dict, device=device).to(device)
         if distributed:
-            model = DDP(
+            model = _wrap_ddp(
                 model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=True,
+                local_rank,
+                find_unused_parameters=bool(args.find_unused_parameters),
+                static_graph=(not args.no_static_graph),
             )
 
         loss_fn = build_loss_fn(cfg_dict).to(device)
-        optimizer = optim.AdamW(_unwrap_model(model).parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = _build_optimizer(_unwrap_model(model), lr=lr, weight_decay=weight_decay)
 
         steps_per_epoch = len(train_loader) if args.max_train_steps <= 0 else min(len(train_loader), args.max_train_steps)
         total_train_steps = max(1, args.epochs * max(1, steps_per_epoch))
         warmup_steps = max(0, min(warmup_steps_cfg, max(0, total_train_steps - 1)))
+        effective_lr_min_ratio = lr_min_ratio
+        if (lr_scheduler_name == "cosine") and (total_train_steps <= short_cosine_steps):
+            # Avoid decaying LR too aggressively for short debug/quick runs.
+            effective_lr_min_ratio = max(lr_min_ratio, short_cosine_lr_floor)
+            if warmup_steps == 0:
+                warmup_steps = max(1, int(total_train_steps * short_cosine_warmup_ratio))
+                warmup_steps = min(warmup_steps, max(0, total_train_steps - 1))
         if lr_scheduler_name == "cosine":
             if warmup_steps > 0:
                 def _warmup_cosine_lambda(step: int) -> float:
@@ -865,14 +1055,14 @@ def main() -> None:
                         return float(step) / float(max(1, warmup_steps))
                     progress = float(step - warmup_steps) / float(max(1, total_train_steps - warmup_steps))
                     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-                    return lr_min_ratio + (1.0 - lr_min_ratio) * cosine
+                    return effective_lr_min_ratio + (1.0 - effective_lr_min_ratio) * cosine
 
                 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_warmup_cosine_lambda)
             else:
                 scheduler = optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
                     T_max=total_train_steps,
-                    eta_min=lr * lr_min_ratio,
+                    eta_min=lr * effective_lr_min_ratio,
                 )
         elif lr_scheduler_name in {"none", "constant"}:
             scheduler = None
@@ -913,9 +1103,16 @@ def main() -> None:
             print("[TensorBoard] VSCode: Python: Launch TensorBoard -> select this logdir.")
             print(f"[Checkpoint] dir: {ckpt_dir}")
             print(f"Train batches (per-rank): {len(train_loader)} world_size={_get_world_size()}")
+            model_depth_type = _unwrap_model(model).depth_estimator.cfg.depth_type
+            print(f"[Depth/Loss] model_depth_type={model_depth_type} loss_depth_types={list(loss_fn.cfg.depth_types)}")
+            if distributed:
+                print(
+                    f"[DDP] find_unused_parameters={bool(args.find_unused_parameters)} "
+                    f"static_graph={not args.no_static_graph}"
+                )
             print(
                 f"[Scheduler] type={lr_scheduler_name} warmup_steps={warmup_steps} "
-                f"lr_min_ratio={lr_min_ratio:.4f}"
+                f"lr_min_ratio={effective_lr_min_ratio:.4f} total_steps={total_train_steps}"
             )
             if val_loader is not None:
                 print(f"Val batches (per-rank): {len(val_loader)}")

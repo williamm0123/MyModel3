@@ -546,7 +546,7 @@ class StageCfg:
     """Configuration for StageNet."""
     ndepths: int = 32
     base_ch: int = 8
-    depth_type: str = "regression"  # "ce" or "regression"
+    depth_type: str = "ce"  # "ce" or "regression"
     cost_reg_type: str = "Normal"   # "Normal" or "PureTransformerCostReg"
     transformer_heads: int = 8
     transformer_layers: int = 2

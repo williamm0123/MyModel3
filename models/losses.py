@@ -24,7 +24,7 @@ import torch.nn.functional as F
 class LossCfg:
     """Configuration for loss functions."""
     # Loss type per stage: "ce" (cross-entropy) or "reg" (regression)
-    depth_types: Tuple[str, ...] = ("reg", "reg", "reg", "reg")
+    depth_types: Tuple[str, ...] = ("ce", "ce", "ce", "ce")
     
     # Loss weights per stage
     loss_weights: Tuple[float, ...] = (1.0, 1.0, 1.0, 1.0)
@@ -325,9 +325,9 @@ def create_multiscale_gt(
             depth_gt_ms[stage_key] = depth_gt
             mask_ms[stage_key] = mask
         else:
-            # Downsample with nearest for mask, bilinear for depth
+            # Match official MVSFormer++ supervision: nearest for both depth and mask.
             depth_gt_ms[stage_key] = F.interpolate(
-                depth_gt.unsqueeze(1), size=(h, w), mode='bilinear', align_corners=False
+                depth_gt.unsqueeze(1), size=(h, w), mode='nearest'
             ).squeeze(1)
             mask_ms[stage_key] = F.interpolate(
                 mask.float().unsqueeze(1), size=(h, w), mode='nearest'

@@ -44,7 +44,7 @@ class DepthEstimatorCfg:
     inverse_depth: bool = True
     
     # Depth type: "ce" (cross-entropy) or "regression"
-    depth_type: str = "regression"
+    depth_type: str = "ce"
     
     # Temperature for softmax during inference
     temperatures: Tuple[float, ...] = (5.0, 5.0, 5.0, 1.0)
