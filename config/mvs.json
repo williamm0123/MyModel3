@@ -2,7 +2,7 @@
   "comment": "Merged MVSFormer++ configuration (high-memory profile for 2xV100 32GB)",
   "mode": "train",
 
-  "datapath": "${DATA_ROOT}/dataset/DTU/dtu_training/",
+  "datapath": "$/scr/user/qinglong/dataset/DTU/dtu_training/",
   "train_data_list": "lists/dtu/train.txt",
   "val_data_list": "lists/dtu/test.txt",
   "all_views": "49",
@@ -42,7 +42,7 @@
   },
 
   "dinov3": {
-    "weights": "${DATA_ROOT}/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "weights": "/scr/user/qinglong/dataset/DINOv3/pre_trained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
     "arch": "dinov3_vitb16",
     "patch_size": 16,
     "input_scale": 1.0,
