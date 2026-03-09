@@ -134,6 +134,26 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+def _normalize_input_path(path_like: str, *, project_root: Path) -> str:
+    """
+    Normalize user-input path from CLI.
+    Supports: absolute path, relative path, ~/, $VAR, ${VAR}, and common typo '$/...'.
+    """
+    raw = str(path_like).strip()
+    if raw.startswith("$/"):
+        raw = raw[1:]
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if "$" in expanded:
+        raise ValueError(
+            f"Unresolved environment variable in path: {path_like}. "
+            "Please use an absolute path or export the variable first."
+        )
+    p = Path(expanded)
+    if not p.is_absolute():
+        p = (project_root / p).resolve()
+    return str(p)
+
+
 def _wrap_ddp(
     model: nn.Module,
     local_rank: int,
@@ -952,7 +972,7 @@ def main() -> None:
             cfg_dict["train"]["weight_decay"] = args.weight_decay
 
         if args.data_root:
-            cfg_dict["datapath"] = args.data_root
+            cfg_dict["datapath"] = _normalize_input_path(args.data_root, project_root=project_root)
 
         # Keep model depth type and loss depth types consistent across config variants.
         _normalize_model_and_loss_cfg(cfg_dict)
@@ -996,6 +1016,12 @@ def main() -> None:
         else:
             if not cfg_dict.get("datapath", ""):
                 raise ValueError("No datapath configured. Set 'datapath' in config or pass --data_root.")
+            data_root_path = Path(str(cfg_dict["datapath"]))
+            if not data_root_path.exists():
+                raise FileNotFoundError(
+                    f"Dataset root not found: {data_root_path}. "
+                    "Please check --data_root or config.datapath."
+                )
             train_dataset = DTUData(cfg_dict, split="train", sample_mode="mvs")
             val_dataset = None if args.no_val else DTUData(cfg_dict, split="val", sample_mode="mvs")
 

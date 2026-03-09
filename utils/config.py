@@ -38,7 +38,16 @@ def _expand_env_vars(obj: Any, *, strict: bool = True) -> Any:
 
 
 def _resolve_path_if_relative(path_like: str) -> str:
-    p = Path(path_like)
+    raw = str(path_like).strip()
+    if raw.startswith("$/"):
+        raw = raw[1:]
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if "$" in expanded:
+        raise ValueError(
+            f"Unresolved environment variable in path: {path_like}. "
+            "Please export it (or use an absolute path)."
+        )
+    p = Path(expanded)
     if p.is_absolute():
         return str(p)
     return str((_PROJECT_ROOT / p).resolve())
